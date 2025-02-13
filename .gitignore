@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+.DS_Store
+
+movie_lines.txt
+wikipedia_cache/
+
+#models
+initial_transformer/transformer_lm.pth

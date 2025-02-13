@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import pickle
-from models import TransformerLM  # Import the model
+from initial_transformer.models import TransformerLM  # Import the model
 
 # Function to build reverse vocab for decoding
 def build_reverse_vocab(vocab):

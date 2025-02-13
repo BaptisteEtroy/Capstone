@@ -10,7 +10,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import StepLR
 
-from models import TransformerLM  # Import the model from models.py
+from initial_transformer.models import TransformerLM  # Import the model from models.py
 
 #############################################
 # 1. Load and Preprocess Movie Conversations
