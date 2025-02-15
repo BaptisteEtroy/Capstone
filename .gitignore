@@ -1,9 +1,16 @@
+# Byte-compiled / optimized / DLL files
 venv/
 __pycache__/
 .DS_Store
 
+#data
 movie_lines.txt
 wikipedia_cache/
+glove.6B.50d.txt
+glove.6B.100d.txt
+glove.6B.200d.txt
+glove.6B.300d.txt
 
 #models
-initial_transformer/transformer_lm.pth
+transformer_lm.pth
+vocab.pkl
