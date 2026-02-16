@@ -44,7 +44,7 @@ HOOK_TYPE = "resid_post"
 
 # SAE: Standard architecture with L1 regularization (lit review: most effective method)
 EXPANSION_FACTOR = 8  # Hidden dim = 768 * 8 = 6144
-L1_COEFFICIENT = 0.1  # High value needed due to d_hidden normalization
+L1_COEFFICIENT = 1e-3  # Standard value (no normalization)
 
 # Training
 LEARNING_RATE = 1e-4
@@ -129,7 +129,7 @@ class SparseAutoencoder(nn.Module):
         
         # Losses
         reconstruction_loss = F.mse_loss(reconstructed, x)
-        sparsity_loss = hidden.abs().sum(dim=-1).mean() / self.d_hidden
+        sparsity_loss = hidden.abs().mean()  # L1 penalty on activations
         loss = reconstruction_loss + self.l1_coeff * sparsity_loss
         l0_sparsity = (hidden > 0).float().sum(dim=-1).mean()
         
