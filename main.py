@@ -397,6 +397,7 @@ def analyze_features(
     Output-centric (VocabProj): Project decoder vectors onto vocabulary space
     
     This combination captures both what triggers features AND their effect on outputs.
+    Uses batched computation to avoid memory issues.
     """
     device = device or get_device()
     sae = sae.to(device).eval()
@@ -406,22 +407,27 @@ def analyze_features(
     # Get decoder vectors (feature directions)
     decoder_weights = sae.decoder.weight.detach()  # [d_model, d_hidden]
     
-    # Encode all activations to get feature activations
-    print("  Computing feature activations...")
-    all_features = []
-    for i in tqdm(range(0, len(activations), BATCH_SIZE), desc="  Encoding"):
+    # Compute statistics in batches (avoids 30GB tensor in memory)
+    print("  Computing feature statistics (batched)...")
+    n_tokens = 0
+    feature_sum = torch.zeros(sae.d_hidden)
+    feature_count = torch.zeros(sae.d_hidden)  # Count of non-zero activations
+    feature_max = torch.full((sae.d_hidden,), float('-inf'))
+    
+    for i in tqdm(range(0, len(activations), BATCH_SIZE), desc="  Processing"):
         batch = activations[i:i+BATCH_SIZE].to(device)
         with torch.no_grad():
-            features = sae.encode(batch)
-        all_features.append(features.cpu())
+            features = sae.encode(batch).cpu()
+        
+        # Update running statistics
+        feature_sum += features.sum(dim=0)
+        feature_count += (features > 0).float().sum(dim=0)
+        feature_max = torch.max(feature_max, features.max(dim=0).values)
+        n_tokens += features.shape[0]
     
-    feature_acts = torch.cat(all_features, dim=0)  # [n_tokens, d_hidden]
-    
-    # Compute feature statistics
-    print("  Computing feature statistics...")
-    feature_freq = (feature_acts > 0).float().mean(dim=0)
-    feature_mean = feature_acts.mean(dim=0)
-    feature_max = feature_acts.max(dim=0).values
+    # Finalize statistics
+    feature_freq = feature_count / n_tokens
+    feature_mean = feature_sum / n_tokens
     
     # Output-centric: Project decoder vectors onto vocabulary (VocabProj method)
     print("  Computing vocabulary projections...")
@@ -483,18 +489,27 @@ def save_results(
     torch.save(decoder_vectors, output_dir / "decoder_vectors.pt")
     print(f"  Saved decoder vectors: {decoder_vectors.shape}")
     
-    # Save feature activations
+    # Compute summary stats in batches (avoid huge tensor in memory)
     device = get_device()
     sae = sae.to(device).eval()
-    all_features = []
-    for i in range(0, len(activations), BATCH_SIZE):
+    
+    n_tokens = 0
+    feature_count = torch.zeros(sae.d_hidden)
+    total_l0 = 0.0
+    
+    print("  Computing summary statistics (batched)...")
+    for i in tqdm(range(0, len(activations), BATCH_SIZE), desc="  Stats"):
         batch = activations[i:i+BATCH_SIZE].to(device)
         with torch.no_grad():
-            features = sae.encode(batch)
-        all_features.append(features.cpu())
-    feature_acts = torch.cat(all_features, dim=0)
-    torch.save(feature_acts, output_dir / "feature_activations.pt")
-    print(f"  Saved feature activations: {feature_acts.shape}")
+            features = sae.encode(batch).cpu()
+        
+        feature_count += (features > 0).float().sum(dim=0)
+        total_l0 += (features > 0).float().sum(dim=-1).sum().item()
+        n_tokens += features.shape[0]
+    
+    feature_freq = feature_count / n_tokens
+    dead_features = (feature_freq < 1e-5).sum().item()
+    avg_l0 = total_l0 / n_tokens
     
     # Save feature analysis
     features_data = [
@@ -515,11 +530,6 @@ def save_results(
     with open(output_dir / "training_history.json", "w") as f:
         json.dump(history, f, indent=2)
     print(f"  Saved training history")
-    
-    # Summary stats
-    feature_freq = (feature_acts > 0).float().mean(dim=0)
-    dead_features = (feature_freq < 1e-5).sum().item()
-    avg_l0 = (feature_acts > 0).float().sum(dim=-1).mean().item()
     
     summary = {
         "model": MODEL_NAME,
@@ -599,8 +609,6 @@ def main():
     
     # Step 5: Save results
     save_results(sae, activations, features_info, history)
-    
-    print("\nDone!")
 
 
 if __name__ == "__main__":
