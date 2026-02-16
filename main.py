@@ -44,11 +44,11 @@ HOOK_TYPE = "resid_post"
 
 # SAE: Standard architecture with L1 regularization (lit review: most effective method)
 EXPANSION_FACTOR = 8  # Hidden dim = 768 * 8 = 6144
-L1_COEFFICIENT = 1e-3  # Standard value (no normalization)
+L1_COEFFICIENT = 5
 
 # Training
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 5
+NUM_EPOCHS = 15
 BATCH_SIZE = 4096
 NUM_SAMPLES = 10000
 
