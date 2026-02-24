@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
 """
-Feature Analysis & Steering
-============================
-Analyze learned SAE features and steer GPT-2 behavior by intervening on features.
-
 Usage:
     python steer.py --analyze              # Analyze top features
     python steer.py --steer "Hello"        # Generate with feature steering
@@ -15,8 +11,6 @@ import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import torch
-import torch.nn.functional as F
-from pathlib import Path
 from typing import Optional, List, Tuple, Callable
 from dataclasses import dataclass
 import argparse
@@ -25,16 +19,13 @@ import json
 from transformer_lens import HookedTransformer
 from transformer_lens.hook_points import HookPoint
 
-# Import SAE class from main
-from main import SparseAutoencoder, D_MODEL, TARGET_LAYER, HOOK_TYPE, get_device
-
-# =============================================================================
-# Configuration
-# =============================================================================
-
-OUTPUT_DIR = Path("outputs")
-SAE_PATH = OUTPUT_DIR / "sae.pt"
-FEATURES_PATH = OUTPUT_DIR / "features.json"
+# Import from config
+from config import (
+    SparseAutoencoder,
+    TARGET_LAYER, HOOK_TYPE,
+    OUTPUT_DIR, SAE_PATH, FEATURES_PATH,
+    get_device,
+)
 
 
 # =============================================================================
