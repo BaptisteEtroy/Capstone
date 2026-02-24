@@ -294,10 +294,11 @@ def analyze_features(
     # Create mask for content tokens (non-BOS positions)
     content_mask = token_ids != bos_token_id
     
-    # Select top features by frequency (these are the interesting ones)
-    num_features_to_analyze = min(100, sae.d_hidden)
+    # Analyze ALL features (sorted by frequency for output ordering)
+    num_features_to_analyze = sae.d_hidden
     top_feature_indices = feature_freq.topk(num_features_to_analyze).indices.tolist()
     top_feature_set = set(top_feature_indices)
+    print(f"    Analyzing all {num_features_to_analyze} features...")
     
     # Track top-k activations per feature
     topk_per_feature = top_k

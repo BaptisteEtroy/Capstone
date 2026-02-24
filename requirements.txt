@@ -13,3 +13,7 @@ tqdm>=4.66.0
 
 # Logging (required by transformer-lens)
 wandb>=0.15.0
+
+# Feature labeling
+python-dotenv>=1.0.0
+openai==0.28.0

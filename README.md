@@ -15,31 +15,18 @@ pip install -r requirements.txt
 
 ```bash
 python main.py
+
+python steer.py
+
+python label_features.py
 ```
 
-This will:
-1. Load GPT-2 via TransformerLens
-2. Collect ~10,000 text samples from OpenWebText
-3. Extract residual stream activations from layer 6
-4. Train an SAE (768 → 6144 → 768 with 8x expansion)
-5. Analyse features using outpuut and input centric methopds
-6. Save all results to `outputs/`
+config.py has all the training and model configurations as well as the data classes for the SAE
 
-### Quick Test
+main.py trains the model and does a input/ouput centric feature analysis.
 
-```bash
-python main.py --quick
-```
+label_features.py does exactly what you think it does
 
-Runs a minimal test (500 samples, 1 epoch) to verify the pipeline works.
-
-### Resume from Cached Activations
-
-```bash
-python main.py --skip-collection
-```
-
-Skips activation collection and uses cached `outputs/activations.pt`.
 
 ## Output Files
 
