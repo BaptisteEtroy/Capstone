@@ -22,7 +22,7 @@ This will:
 2. Collect ~10,000 text samples from OpenWebText
 3. Extract residual stream activations from layer 6
 4. Train an SAE (768 → 6144 → 768 with 8x expansion)
-5. Analyse features using VocabProj method
+5. Analyse features using outpuut and input centric methopds
 6. Save all results to `outputs/`
 
 ### Quick Test

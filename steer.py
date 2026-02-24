@@ -104,7 +104,7 @@ def analyze_feature(
 
 
 def print_feature_analysis(analysis: dict):
-    """Pretty print feature analysis."""
+    """Pretty print feature analysis (VocabProj only - computed on-the-fly)."""
     print(f"\n{'='*60}")
     print(f"  Feature {analysis['feature_idx']}")
     print(f"{'='*60}")
@@ -116,6 +116,36 @@ def print_feature_analysis(analysis: dict):
     print("\n  SUPPRESSES (tokens this feature pushes away from):")
     for t in analysis["suppresses"][:5]:
         print(f"    {t['token']:20s}  logit: {t['logit']:+.2f}")
+
+
+def print_saved_feature(feature_data: dict):
+    """
+    Pretty print feature analysis from saved features.json.
+    Shows both MaxAct (input-centric) and VocabProj (output-centric).
+    """
+    print(f"\n{'='*60}")
+    print(f"  Feature {feature_data['index']}")
+    print(f"  Frequency: {feature_data['frequency']*100:.1f}%  |  Max activation: {feature_data['max']:.1f}")
+    print(f"{'='*60}")
+    
+    # Input-centric: MaxAct - what triggers this feature
+    print("\n  INPUT-CENTRIC (MaxAct): Tokens that ACTIVATE this feature")
+    print("  (What concepts/patterns does this feature detect?)")
+    if "max_activating_tokens" in feature_data and feature_data["max_activating_tokens"]:
+        for t in feature_data["max_activating_tokens"][:5]:
+            tok = repr(t["token"]) if isinstance(t, dict) else repr(t)
+            act = t.get("activation", 0) if isinstance(t, dict) else 0
+            print(f"    {tok:25s}  activation: {act:.1f}")
+    else:
+        print("    (No MaxAct data available)")
+    
+    # Output-centric: VocabProj - what this feature does
+    print("\n  OUTPUT-CENTRIC (VocabProj): Tokens this feature PROMOTES")
+    print("  (What effect does this feature have on predictions?)")
+    if "vocab_projection" in feature_data:
+        logits = feature_data.get("vocab_projection_logits", [0] * len(feature_data["vocab_projection"]))
+        for tok, logit in zip(feature_data["vocab_projection"][:5], logits[:5]):
+            print(f"    {repr(tok):25s}  logit: {logit:+.2f}")
 
 
 def find_features_for_concept(
@@ -403,16 +433,19 @@ def main():
         interactive_mode(sae, model)
         
     elif args.analyze:
-        # Load saved feature analysis
+        # Load saved feature analysis (with both MaxAct and VocabProj)
         if FEATURES_PATH.exists():
             with open(FEATURES_PATH) as f:
                 features = json.load(f)
-            print(f"\nAnalyzing top {len(features)} features from training...")
+            print(f"\nDisplaying top {min(10, len(features))} features (MaxAct + VocabProj)...")
+            print("="*60)
+            print("  MaxAct (input-centric): What tokens TRIGGER each feature")
+            print("  VocabProj (output-centric): What tokens each feature PROMOTES")
+            print("="*60)
             for feat in features[:10]:
-                analysis = analyze_feature(feat["index"], sae, model)
-                print_feature_analysis(analysis)
+                print_saved_feature(feat)
         else:
-            print("No features.json found. Analyzing first 10 features...")
+            print("No features.json found. Computing VocabProj for first 10 features...")
             for i in range(10):
                 analysis = analyze_feature(i, sae, model)
                 print_feature_analysis(analysis)

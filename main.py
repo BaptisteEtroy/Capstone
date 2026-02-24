@@ -203,17 +203,25 @@ def load_gpt2(device: Optional[str] = None) -> HookedTransformer:
     return model
 
 
+@dataclass
+class ActivationData:
+    """Container for activations and their corresponding token IDs."""
+    activations: torch.Tensor  # [n_tokens, d_model]
+    token_ids: torch.Tensor    # [n_tokens] - the actual input tokens
+
+
 @torch.no_grad()
 def collect_activations(
     model: HookedTransformer,
     num_samples: int = NUM_SAMPLES,
     batch_size: int = 32,
     max_tokens: int = 128,
-) -> torch.Tensor:
+) -> ActivationData:
     """
     Collect residual stream activations from GPT-2 layer 6.
     
     Uses OpenWebText dataset for diverse text inputs.
+    Returns both activations and corresponding token IDs for MaxAct analysis.
     """
     hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
     print(f"\nCollecting activations from {hook_point}...")
@@ -223,6 +231,7 @@ def collect_activations(
     dataset = load_dataset("openwebtext", split="train", streaming=True)
     
     all_activations = []
+    all_token_ids = []
     batch = []
     count = 0
     
@@ -247,6 +256,9 @@ def collect_activations(
             acts = cache[hook_point].reshape(-1, D_MODEL).cpu()
             all_activations.append(acts)
             
+            # Store flattened token IDs (matches activation shape)
+            all_token_ids.append(tokens.reshape(-1).cpu())
+            
             del cache
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
             batch = []
@@ -262,12 +274,15 @@ def collect_activations(
         _, cache = model.run_with_cache(tokens, names_filter=[hook_point])
         acts = cache[hook_point].reshape(-1, D_MODEL).cpu()
         all_activations.append(acts)
+        all_token_ids.append(tokens.reshape(-1).cpu())
     
     pbar.close()
     
     activations = torch.cat(all_activations, dim=0)
+    token_ids = torch.cat(all_token_ids, dim=0)
+    
     print(f"  Collected {activations.shape[0]:,} token activations")
-    return activations
+    return ActivationData(activations=activations, token_ids=token_ids)
 
 
 # =============================================================================
@@ -373,92 +388,187 @@ def train_sae(
 # =============================================================================
 
 @dataclass
+class MaxActExample:
+    """A single example of a token that strongly activates a feature."""
+    token: str
+    token_id: int
+    activation: float
+
+
+@dataclass
 class FeatureInfo:
-    """Information about a learned feature."""
+    """
+    Information about a learned feature using both interpretability methods.
+    
+    Input-centric (MaxAct): What inputs trigger this feature?
+    Output-centric (VocabProj): What outputs does this feature promote?
+    """
     index: int
     activation_frequency: float
     mean_activation: float
     max_activation: float
-    top_tokens: List[str]  # MaxAct: tokens that maximally activate this feature
-    vocab_projection: List[str]  # VocabProj: tokens the feature points toward
+    
+    # Input-centric: tokens that maximally ACTIVATE this feature (what triggers it)
+    max_activating_tokens: List[MaxActExample]
+    
+    # Output-centric: tokens this feature PROMOTES in output (what it does)
+    vocab_projection: List[str]
+    vocab_projection_logits: List[float]
 
 
 def analyze_features(
     sae: SparseAutoencoder,
     model: HookedTransformer,
-    activations: torch.Tensor,
+    activation_data: ActivationData,
     top_k: int = 20,
     device: Optional[str] = None,
 ) -> List[FeatureInfo]:
     """
     Analyze learned features using combined input/output-centric methods.
     
-    Input-centric (MaxAct): Find tokens that maximally activate each feature
-    Output-centric (VocabProj): Project decoder vectors onto vocabulary space
+    Input-centric (MaxAct): Find the actual input tokens that maximally activate 
+    each feature. This tells us what concepts/patterns the feature detects.
     
-    This combination captures both what triggers features AND their effect on outputs.
-    Uses batched computation to avoid memory issues.
+    Output-centric (VocabProj): Project decoder vectors onto unembedding matrix
+    to see what tokens the feature promotes in the output. This tells us
+    what effect the feature has on model predictions.
+    
+    The combination captures both WHAT TRIGGERS features AND THEIR EFFECT on outputs.
     """
     device = device or get_device()
     sae = sae.to(device).eval()
     
+    activations = activation_data.activations
+    token_ids = activation_data.token_ids
+    
     print("\nAnalyzing features...")
+    print("  Method 1: MaxAct (input-centric) - what tokens activate each feature")
+    print("  Method 2: VocabProj (output-centric) - what tokens each feature promotes")
     
     # Get decoder vectors (feature directions)
     decoder_weights = sae.decoder.weight.detach()  # [d_model, d_hidden]
     
-    # Compute statistics in batches (avoids 30GB tensor in memory)
-    print("  Computing feature statistics (batched)...")
+    # =========================================================================
+    # Pass 1: Compute basic statistics (batched for memory efficiency)
+    # =========================================================================
+    print("\n  Pass 1: Computing feature statistics...")
+    
     n_tokens = 0
     feature_sum = torch.zeros(sae.d_hidden)
-    feature_count = torch.zeros(sae.d_hidden)  # Count of non-zero activations
+    feature_count = torch.zeros(sae.d_hidden)
     feature_max = torch.full((sae.d_hidden,), float('-inf'))
     
-    for i in tqdm(range(0, len(activations), BATCH_SIZE), desc="  Processing"):
+    for i in tqdm(range(0, len(activations), BATCH_SIZE), desc="  Stats"):
         batch = activations[i:i+BATCH_SIZE].to(device)
         with torch.no_grad():
             features = sae.encode(batch).cpu()
         
-        # Update running statistics
         feature_sum += features.sum(dim=0)
         feature_count += (features > 0).float().sum(dim=0)
         feature_max = torch.max(feature_max, features.max(dim=0).values)
         n_tokens += features.shape[0]
     
-    # Finalize statistics
     feature_freq = feature_count / n_tokens
     feature_mean = feature_sum / n_tokens
     
-    # Output-centric: Project decoder vectors onto vocabulary (VocabProj method)
-    print("  Computing vocabulary projections...")
+    # =========================================================================
+    # Pass 2: MaxAct - Find top activating tokens for TOP features only
+    # (Computing for all 6144 features is expensive, so we focus on active ones)
+    # =========================================================================
+    print("\n  Pass 2: Computing MaxAct for top features...")
+    
+    # Select top features by frequency (these are the interesting ones)
+    num_features_to_analyze = min(100, sae.d_hidden)
+    top_feature_indices = feature_freq.topk(num_features_to_analyze).indices.tolist()
+    top_feature_set = set(top_feature_indices)
+    
+    # Track top-k activations per feature
+    topk_per_feature = top_k
+    max_act_values = {idx: torch.full((topk_per_feature,), float('-inf')) for idx in top_feature_indices}
+    max_act_indices = {idx: torch.zeros(topk_per_feature, dtype=torch.long) for idx in top_feature_indices}
+    
+    for i in tqdm(range(0, len(activations), BATCH_SIZE), desc="  MaxAct"):
+        batch = activations[i:i+BATCH_SIZE].to(device)
+        batch_start_idx = i
+        
+        with torch.no_grad():
+            features = sae.encode(batch).cpu()  # [batch_size, d_hidden]
+        
+        # For each feature we're tracking, update its top-k
+        for feat_idx in top_feature_indices:
+            feat_acts = features[:, feat_idx]  # [batch_size]
+            
+            # Combine current batch with existing top-k and keep overall top-k
+            combined_vals = torch.cat([max_act_values[feat_idx], feat_acts])
+            combined_idxs = torch.cat([
+                max_act_indices[feat_idx],
+                torch.arange(batch_start_idx, batch_start_idx + len(feat_acts))
+            ])
+            
+            # Get top-k from combined
+            topk_vals, topk_positions = combined_vals.topk(topk_per_feature)
+            max_act_values[feat_idx] = topk_vals
+            max_act_indices[feat_idx] = combined_idxs[topk_positions]
+    
+    # =========================================================================
+    # Output-centric: VocabProj - Project decoder vectors onto vocabulary
+    # =========================================================================
+    print("  Computing VocabProj (output-centric)...")
     unembed = model.W_U.detach()  # [d_model, vocab_size]
     vocab_logits = decoder_weights.T @ unembed  # [d_hidden, vocab_size]
-    top_vocab_indices = vocab_logits.topk(top_k, dim=-1).indices  # [d_hidden, top_k]
+    top_vocab_values, top_vocab_indices = vocab_logits.topk(top_k, dim=-1)
     
-    # Get tokenizer for decoding
     tokenizer = model.tokenizer
     
-    # Analyze top features by activation frequency
-    print("  Analyzing top features...")
-    top_feature_indices = feature_freq.topk(min(100, sae.d_hidden)).indices
+    # =========================================================================
+    # Build FeatureInfo for top features
+    # =========================================================================
+    print("\n  Building feature analysis...")
     
     features_info = []
-    for idx in tqdm(top_feature_indices, desc="  Features"):
-        idx = idx.item()
+    for feat_idx in tqdm(top_feature_indices, desc="  Features"):
+        # Sort MaxAct results by activation value (descending)
+        sorted_order = max_act_values[feat_idx].argsort(descending=True)
         
-        # VocabProj: tokens this feature points toward
-        vocab_tokens = [tokenizer.decode([t.item()]).strip() for t in top_vocab_indices[idx][:10]]
+        # Build MaxAct examples (input-centric: what tokens trigger this feature)
+        max_act_examples = []
+        seen_tokens = set()
+        for sort_pos in sorted_order:
+            act_val = max_act_values[feat_idx][sort_pos].item()
+            if act_val <= 0:
+                continue
+            
+            token_global_idx = max_act_indices[feat_idx][sort_pos].item()
+            tok_id = token_ids[token_global_idx].item()
+            tok_str = tokenizer.decode([tok_id])
+            
+            # Deduplicate (same token can appear in multiple positions)
+            if tok_str not in seen_tokens:
+                seen_tokens.add(tok_str)
+                max_act_examples.append(MaxActExample(
+                    token=tok_str,
+                    token_id=tok_id,
+                    activation=act_val,
+                ))
         
-        # MaxAct: would need original text - simplified here
-        top_tokens = vocab_tokens  # Use vocab projection as proxy
+        # VocabProj: tokens this feature promotes (output-centric)
+        vocab_tokens = []
+        vocab_logit_values = []
+        for k in range(min(top_k, 10)):
+            tok_id = top_vocab_indices[feat_idx, k].item()
+            tok_str = tokenizer.decode([tok_id]).strip()
+            logit_val = top_vocab_values[feat_idx, k].item()
+            vocab_tokens.append(tok_str)
+            vocab_logit_values.append(logit_val)
         
         info = FeatureInfo(
-            index=idx,
-            activation_frequency=feature_freq[idx].item(),
-            mean_activation=feature_mean[idx].item(),
-            max_activation=feature_max[idx].item(),
-            top_tokens=top_tokens,
+            index=feat_idx,
+            activation_frequency=feature_freq[feat_idx].item(),
+            mean_activation=feature_mean[feat_idx].item(),
+            max_activation=feature_max[feat_idx].item(),
+            max_activating_tokens=max_act_examples[:10],
             vocab_projection=vocab_tokens,
+            vocab_projection_logits=vocab_logit_values,
         )
         features_info.append(info)
     
@@ -467,7 +577,7 @@ def analyze_features(
 
 def save_results(
     sae: SparseAutoencoder,
-    activations: torch.Tensor,
+    activation_data: ActivationData,
     features_info: List[FeatureInfo],
     history: Dict[str, List[float]],
     output_dir: Path = OUTPUT_DIR,
@@ -475,14 +585,19 @@ def save_results(
     """Save all results to disk."""
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    activations = activation_data.activations
+    token_ids = activation_data.token_ids
+    
     print(f"\nSaving results to {output_dir}...")
     
     # Save SAE
     sae.save(output_dir / "sae.pt")
     
-    # Save activations
+    # Save activations and token IDs
     torch.save(activations, output_dir / "activations.pt")
+    torch.save(token_ids, output_dir / "token_ids.pt")
     print(f"  Saved activations: {activations.shape}")
+    print(f"  Saved token_ids: {token_ids.shape}")
     
     # Save decoder vectors
     decoder_vectors = sae.decoder.weight.detach().cpu()
@@ -511,20 +626,29 @@ def save_results(
     dead_features = (feature_freq < 1e-5).sum().item()
     avg_l0 = total_l0 / n_tokens
     
-    # Save feature analysis
+    # Save feature analysis with both MaxAct and VocabProj
     features_data = [
         {
             "index": f.index,
             "frequency": f.activation_frequency,
             "mean": f.mean_activation,
             "max": f.max_activation,
+            # Input-centric: what tokens activate this feature
+            "max_activating_tokens": [
+                {"token": ex.token, "token_id": ex.token_id, "activation": ex.activation}
+                for ex in f.max_activating_tokens
+            ],
+            # Output-centric: what tokens this feature promotes
             "vocab_projection": f.vocab_projection,
+            "vocab_projection_logits": f.vocab_projection_logits,
         }
         for f in features_info
     ]
     with open(output_dir / "features.json", "w") as f:
         json.dump(features_data, f, indent=2)
     print(f"  Saved feature analysis: {len(features_info)} features")
+    print(f"    - MaxAct (input-centric): tokens that activate each feature")
+    print(f"    - VocabProj (output-centric): tokens each feature promotes")
     
     # Save training history
     with open(output_dir / "training_history.json", "w") as f:
@@ -541,6 +665,7 @@ def save_results(
         "dead_features": dead_features,
         "avg_l0_sparsity": avg_l0,
         "final_loss": history["loss"][-1] if history["loss"] else None,
+        "analysis_methods": ["MaxAct (input-centric)", "VocabProj (output-centric)"],
     }
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
@@ -554,6 +679,7 @@ def save_results(
     print(f"  Features: {sae.d_hidden:,}")
     print(f"  Dead features: {dead_features}")
     print(f"  Avg L0 sparsity: {avg_l0:.1f}")
+    print(f"  Analysis: MaxAct + VocabProj")
     print(f"{'='*60}")
 
 
@@ -585,30 +711,39 @@ def main():
     # Step 1: Load model
     model = load_gpt2(device)
     
-    # Step 2: Collect or load activations
+    # Step 2: Collect or load activations (with token IDs for MaxAct analysis)
     activations_path = OUTPUT_DIR / "activations.pt"
+    token_ids_path = OUTPUT_DIR / "token_ids.pt"
     
-    if args.skip_collection and activations_path.exists():
-        print(f"\nLoading cached activations from {activations_path}...")
+    if args.skip_collection and activations_path.exists() and token_ids_path.exists():
+        print(f"\nLoading cached activations from {OUTPUT_DIR}...")
         activations = torch.load(activations_path)
-        print(f"  Loaded {activations.shape[0]:,} activations")
+        token_ids = torch.load(token_ids_path)
+        activation_data = ActivationData(activations=activations, token_ids=token_ids)
+        print(f"  Loaded {activations.shape[0]:,} activations with token IDs")
+    elif args.skip_collection and activations_path.exists():
+        print(f"\nWARNING: Found activations but no token_ids. Re-collecting for MaxAct analysis...")
+        activation_data = collect_activations(model, num_samples=num_samples)
     else:
-        activations = collect_activations(model, num_samples=num_samples)
+        activation_data = collect_activations(model, num_samples=num_samples)
     
     # Free model memory for training
     del model
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
-    # Step 3: Train SAE
+    # Step 3: Train SAE (uses only activations tensor)
     sae = SparseAutoencoder()
-    history = train_sae(sae, activations, num_epochs=num_epochs, device=device)
+    history = train_sae(sae, activation_data.activations, num_epochs=num_epochs, device=device)
     
-    # Step 4: Analyze features
+    # Step 4: Analyze features (uses both activations and token_ids)
     model = load_gpt2(device)  # Reload for analysis
-    features_info = analyze_features(sae, model, activations, device=device)
+    print("\n  Feature analysis using dual methods:")
+    print("    - MaxAct: Find tokens that maximally activate each feature")
+    print("    - VocabProj: Find tokens each feature promotes in output")
+    features_info = analyze_features(sae, model, activation_data, device=device)
     
     # Step 5: Save results
-    save_results(sae, activations, features_info, history)
+    save_results(sae, activation_data, features_info, history)
 
 
 if __name__ == "__main__":
