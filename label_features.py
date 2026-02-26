@@ -52,7 +52,7 @@ def call_openai(prompt: str, model: str = "gpt-4o-mini") -> str:
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
-            max_tokens=200,
+            max_tokens=2000,  # Enough for ~100 features per batch
         )
         return response["choices"][0]["message"]["content"].strip()
     except ImportError:
@@ -65,7 +65,7 @@ def call_openai(prompt: str, model: str = "gpt-4o-mini") -> str:
 # Feature Labeling Logic (Batched for efficiency)
 # =============================================================================
 
-BATCH_SIZE = 20  # Features per API call
+BATCH_SIZE = 50  # Features per API call (can go up to ~100)
 
 
 def extract_feature_tokens(feature: Dict[str, Any]) -> tuple:
@@ -156,7 +156,7 @@ def label_features(
     features: List[Dict],
     model: str = "gpt-4o-mini",
     dry_run: bool = False,
-    max_features: int = 500,
+    max_features: int = 1000,
     batch_size: int = BATCH_SIZE,
 ) -> List[LabeledFeature]:
     """Label features using OpenAI with batched API calls."""
@@ -276,7 +276,7 @@ def main():
                         help="OpenAI model to use (default: gpt-4o-mini)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview features without API calls")
-    parser.add_argument("--max-features", type=int, default=100,
+    parser.add_argument("--max-features", type=int, default=1000,
                         help="Maximum features to label")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
                         help=f"Features per API call (default: {BATCH_SIZE})")

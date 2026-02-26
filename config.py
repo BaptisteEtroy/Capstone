@@ -16,24 +16,24 @@ from typing import List
 # Configuration Constants
 # =============================================================================
 
-# Model: GPT-2 (well-studied, no auth required, good for interpretability)
-MODEL_NAME = "gpt2"
-D_MODEL = 768
-N_LAYERS = 12
+# Model: GPT-2 Medium (355M params, richer representations)
+MODEL_NAME = "gpt2-medium"
+D_MODEL = 1024
+N_LAYERS = 24
 
 # Layer: Middle layer for semantic features (lit review: features are most interpretable here)
-TARGET_LAYER = 6
+TARGET_LAYER = 12  # Middle of 24 layers
 HOOK_TYPE = "resid_post"
 
 # SAE: Standard architecture with L1 regularization (lit review: most effective method)
-EXPANSION_FACTOR = 8  # Hidden dim = 768 * 8 = 6144
-L1_COEFFICIENT = 10
+EXPANSION_FACTOR = 8  # Hidden dim = 1024 * 8 = 8192 features
+L1_COEFFICIENT = 50  # Aggressive sparsity to hit L0 target of 50-200
 
 # Training
-LEARNING_RATE = 1e-4
-NUM_EPOCHS = 10
+LEARNING_RATE = 1e-4  # convergence
+NUM_EPOCHS = 3        # Plateau after ~3 epochs anyway
 BATCH_SIZE = 4096
-NUM_SAMPLES = 10000
+NUM_SAMPLES = 50_000  # 50k samples (fits in 24GB RAM)
 
 # Output
 OUTPUT_DIR = Path("outputs")
