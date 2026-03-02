@@ -13,8 +13,7 @@ import json
 import torch
 import numpy as np
 import gradio as gr
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 import plotly.graph_objects as go
 import plotly.express as px
 from transformer_lens import HookedTransformer
@@ -22,7 +21,7 @@ from transformer_lens import HookedTransformer
 from config import (
     SparseAutoencoder,
     MODEL_NAME, TARGET_LAYER, HOOK_TYPE,
-    OUTPUT_DIR, SAE_PATH, FEATURES_PATH,
+    OUTPUT_DIR, SAE_PATH,
     get_device,
 )
 
@@ -263,47 +262,6 @@ def create_activation_heatmap(text: str) -> go.Figure:
     return fig
 
 
-def create_concept_attribution(text: str) -> go.Figure:
-    """Create bar chart showing concept activation levels."""
-    state.load()
-    
-    if not text.strip():
-        return go.Figure()
-    
-    hidden, _, _ = get_activations(text)
-    hidden_mean = hidden.mean(dim=0).cpu().numpy()  # Average over sequence
-    
-    concept_scores = {}
-    for concept, indices in state.concept_features.items():
-        if indices:
-            scores = hidden_mean[indices]
-            concept_scores[concept] = float(np.mean(scores))
-    
-    # Sort by activation
-    sorted_concepts = sorted(concept_scores.items(), key=lambda x: x[1], reverse=True)
-    concepts = [c[0] for c in sorted_concepts]
-    scores = [c[1] for c in sorted_concepts]
-    
-    colors = ['#2ecc71' if s > 0 else '#e74c3c' for s in scores]
-    
-    fig = go.Figure(data=go.Bar(
-        x=scores,
-        y=concepts,
-        orientation='h',
-        marker_color=colors,
-    ))
-    
-    fig.update_layout(
-        title="Concept Attribution (Average Activation)",
-        xaxis_title="Mean Activation",
-        yaxis_title="Concept",
-        height=300,
-        margin=dict(l=200),
-    )
-    
-    return fig
-
-
 def create_activation_flow(text: str) -> go.Figure:
     """Create line chart showing feature activations across token positions."""
     state.load()
@@ -504,7 +462,6 @@ def build_ui():
         title="SAE Feature Steering Playground",
         theme=gr.themes.Soft(),
         css="""
-        .concept-slider { margin-bottom: 10px; }
         .output-box { font-family: monospace; }
         """
     ) as app:
