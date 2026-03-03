@@ -15,7 +15,6 @@ import numpy as np
 import gradio as gr
 from typing import Dict, List, Tuple
 import plotly.graph_objects as go
-import plotly.express as px
 from transformer_lens import HookedTransformer
 
 from config import (
@@ -53,24 +52,6 @@ def get_feature_choices() -> List[str]:
         return ["No features loaded"]
 
 
-def build_concept_groups(labeled_features: List[Dict]) -> Dict[str, List[int]]:
-    """
-    Build concept groups directly from actual labeled features.
-    Each unique label becomes its own concept group - no hardcoding.
-    """
-    label_to_indices = {}
-    for f in labeled_features:
-        label = f["label"]  # Use exact label as-is
-        idx = f["index"]
-        if label not in label_to_indices:
-            label_to_indices[label] = []
-        label_to_indices[label].append(idx)
-    
-    # Return all labels that have features (sorted by number of features)
-    sorted_groups = sorted(label_to_indices.items(), key=lambda x: len(x[1]), reverse=True)
-    return {k: v for k, v in sorted_groups}
-
-
 # =============================================================================
 # Global State (loaded once)
 # =============================================================================
@@ -80,7 +61,8 @@ class AppState:
         self.model = None
         self.sae = None
         self.labeled_features = []
-        self.concept_features = {}
+        self.all_features = []
+        self.feature_by_index = {}
         self.device = get_device()
         self.loaded = False
     
@@ -104,11 +86,19 @@ class AppState:
         with open(OUTPUT_DIR / "labeled_features.json") as f:
             self.labeled_features = json.load(f)
         
-        # Build concept groups from actual labels (for attribution graphs)
-        self.concept_features = build_concept_groups(self.labeled_features)
+        # Load ALL features (for circuit analysis)
+        features_path = OUTPUT_DIR / "features.json"
+        if features_path.exists():
+            with open(features_path) as f:
+                self.all_features = json.load(f)
+            # Build index lookup
+            self.feature_by_index = {f["index"]: f for f in self.all_features}
+        else:
+            self.all_features = []
+            self.feature_by_index = {}
         
         self.loaded = True
-        print(f"Loaded {len(self.labeled_features)} labeled features")
+        print(f"Loaded {len(self.labeled_features)} labeled features, {len(self.all_features)} total features")
             
 
 state = AppState()
@@ -147,7 +137,7 @@ def generate_with_feature_steering(
     
     Args:
         prompt: Input text
-        feature_strengths: Dict mapping feature index -> strength (-5 to +5)
+        feature_strengths: Dict mapping feature index -> strength
         max_tokens: Max tokens to generate
     """
     state.load()
@@ -162,9 +152,9 @@ def generate_with_feature_steering(
     # Get decoder directions for steering
     decoder = state.sae.decoder.weight.detach()  # [d_model, d_hidden]
     steer_direction = decoder @ steering_vector  # [d_model]
-    
+
     hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
-    
+
     # Generate without steering
     tokens_orig = state.model.to_tokens(prompt)
     with torch.no_grad():
@@ -176,14 +166,23 @@ def generate_with_feature_steering(
             top_p=0.9,
         )
     text_orig = state.model.tokenizer.decode(output_orig[0])
-    
+
     # If no steering, return same for both
     if steering_vector.abs().sum() < 0.1:
         return text_orig, text_orig
-    
+
+    # Scale steering direction by residual stream norm (strength=1.0 → 10% of residual norm)
+    with torch.no_grad():
+        _, cache = state.model.run_with_cache(state.model.to_tokens(prompt))
+        resid_norm = cache[hook_point][0].norm(dim=-1).mean().item()  # avg norm across positions
+
+    steer_unit = steer_direction / (steer_direction.norm() + 1e-8)
+    total_strength = steering_vector.abs().max().item()  # max strength from all features
+    scaled_steer = steer_unit * total_strength * resid_norm * 0.1
+
     # Generate with steering using manual generation loop
     def steering_hook(activation, hook):
-        activation[:, :, :] += steer_direction.unsqueeze(0).unsqueeze(0)
+        activation[:, :, :] += scaled_steer.unsqueeze(0).unsqueeze(0)
         return activation
     
     # Manual generation with hooks
@@ -214,151 +213,6 @@ def generate_with_feature_steering(
     text_steer = state.model.tokenizer.decode(tokens[0])
     
     return text_orig, text_steer
-
-
-def create_activation_heatmap(text: str) -> go.Figure:
-    """Create heatmap of feature activations for labeled features."""
-    state.load()
-    
-    if not text.strip():
-        return go.Figure()
-    
-    hidden, tokens, token_strs = get_activations(text)
-    
-    # Get activations for labeled features only (top 30 most active)
-    labeled_indices = [f["index"] for f in state.labeled_features]
-    labeled_labels = [f["label"] for f in state.labeled_features]
-    
-    # Get activations for these features
-    labeled_acts = hidden[:, labeled_indices].cpu().numpy()  # [seq_len, n_labeled]
-    
-    # Find top activated features across all tokens
-    max_acts = labeled_acts.max(axis=0)
-    top_feature_idx = np.argsort(max_acts)[-20:][::-1]  # Top 20
-    
-    # Build heatmap data
-    heatmap_data = labeled_acts[:, top_feature_idx].T  # [n_features, seq_len]
-    feature_names = [labeled_labels[i][:25] for i in top_feature_idx]
-    
-    # Clean token strings for display
-    display_tokens = [t.replace('\n', '\\n')[:10] for t in token_strs]
-    
-    fig = go.Figure(data=go.Heatmap(
-        z=heatmap_data,
-        x=display_tokens,
-        y=feature_names,
-        colorscale='RdBu_r',
-        zmid=0,
-    ))
-    
-    fig.update_layout(
-        title="Feature Activations (Top 20 Active Features)",
-        xaxis_title="Tokens",
-        yaxis_title="Features",
-        height=500,
-        margin=dict(l=150),
-    )
-    
-    return fig
-
-
-def create_activation_flow(text: str) -> go.Figure:
-    """Create line chart showing feature activations across token positions."""
-    state.load()
-    
-    if not text.strip():
-        return go.Figure()
-    
-    hidden, _, token_strs = get_activations(text)
-    
-    # Get top 8 most active labeled features
-    labeled_indices = [f["index"] for f in state.labeled_features]
-    labeled_labels = [f["label"] for f in state.labeled_features]
-    
-    labeled_acts = hidden[:, labeled_indices].cpu().numpy()
-    max_acts = labeled_acts.max(axis=0)
-    top_idx = np.argsort(max_acts)[-8:][::-1]
-    
-    # Clean token strings
-    display_tokens = [t.replace('\n', '\\n')[:8] for t in token_strs]
-    
-    fig = go.Figure()
-    colors = px.colors.qualitative.Set2
-    
-    for i, idx in enumerate(top_idx):
-        fig.add_trace(go.Scatter(
-            x=list(range(len(display_tokens))),
-            y=labeled_acts[:, idx],
-            mode='lines+markers',
-            name=labeled_labels[idx][:20],
-            line=dict(color=colors[i % len(colors)], width=2),
-            marker=dict(size=6),
-        ))
-    
-    fig.update_layout(
-        title="Feature Activation Flow Across Tokens",
-        xaxis_title="Token Position",
-        yaxis_title="Activation",
-        xaxis=dict(
-            tickmode='array',
-            tickvals=list(range(len(display_tokens))),
-            ticktext=display_tokens,
-            tickangle=45,
-        ),
-        height=400,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1
-        ),
-        margin=dict(b=100),
-    )
-    
-    return fig
-
-
-def create_concept_pie(text: str) -> go.Figure:
-    """Create pie chart showing distribution of active concepts."""
-    state.load()
-    
-    if not text.strip():
-        return go.Figure()
-    
-    hidden, _, _ = get_activations(text)
-    hidden_mean = hidden.mean(dim=0).cpu().numpy()
-    
-    concept_scores = {}
-    for concept, indices in state.concept_features.items():
-        if indices:
-            scores = hidden_mean[indices]
-            # Only count positive activations
-            positive_score = max(0, float(np.mean(scores)))
-            if positive_score > 0:
-                concept_scores[concept] = positive_score
-    
-    if not concept_scores:
-        return go.Figure()
-    
-    labels = list(concept_scores.keys())
-    values = list(concept_scores.values())
-    
-    fig = go.Figure(data=[go.Pie(
-        labels=labels,
-        values=values,
-        hole=0.4,
-        textinfo='label+percent',
-        textposition='outside',
-    )])
-    
-    fig.update_layout(
-        title="Concept Distribution (Active Features)",
-        height=400,
-        showlegend=False,
-    )
-    
-    return fig
 
 
 def create_feature_ranking(text: str) -> go.Figure:
@@ -447,6 +301,287 @@ def create_feature_detail_table(text: str) -> str:
     
     for f in feature_info[:15]:
         md += f"| {f['index']} | {f['label'][:30]} | {f['confidence']} | {f['max_act']:.2f} |\n"
+    
+    return md
+
+
+# =============================================================================
+# Circuit Analysis Functions (uses ALL features)
+# =============================================================================
+
+def get_feature_label(feature_idx: int) -> str:
+    """Get label for a feature if it exists, otherwise return index."""
+    state.load()
+    for f in state.labeled_features:
+        if f["index"] == feature_idx:
+            return f"{feature_idx}: {f['label']}"
+    return f"Feature {feature_idx}"
+
+
+def get_feature_vocab_projection(feature_idx: int, top_k: int = 5) -> List[Tuple[str, float]]:
+    """Get top tokens this feature promotes (VocabProj)."""
+    state.load()
+
+    decoder_vec = state.sae.decoder.weight[:, feature_idx]  # [d_model]
+    unembed = state.model.W_U  # [d_model, vocab_size]
+    logits = decoder_vec @ unembed  # [vocab_size]
+
+    top_values, top_indices = logits.topk(top_k)
+
+    results = []
+    for val, idx in zip(top_values, top_indices):
+        token = state.model.tokenizer.decode([idx.item()])
+        results.append((token, val.item()))
+
+    return results
+
+
+def get_vocab_projections_batched(feature_indices: List[int], top_k: int = 3) -> Dict[int, List[Tuple[str, float]]]:
+    """Get VocabProj for multiple features in one matmul (~25x faster than looping)."""
+    state.load()
+
+    indices_tensor = torch.tensor(feature_indices, dtype=torch.long)
+    decoder_cols = state.sae.decoder.weight[:, indices_tensor]  # [d_model, n_features]
+    unembed = state.model.W_U  # [d_model, vocab_size]
+    all_logits = decoder_cols.T @ unembed  # [n_features, vocab_size]
+
+    top_values, top_indices = all_logits.topk(top_k, dim=-1)  # [n_features, top_k]
+
+    results = {}
+    for i, feat_idx in enumerate(feature_indices):
+        tokens_logits = []
+        for j in range(top_k):
+            tok = state.model.tokenizer.decode([top_indices[i, j].item()])
+            tokens_logits.append((tok, top_values[i, j].item()))
+        results[feat_idx] = tokens_logits
+
+    return results
+
+
+def analyze_circuit(text: str) -> Tuple[go.Figure, str, str]:
+    """
+    Full circuit analysis: Input tokens → Features → Output tokens
+    Uses ALL features, shows labels when available.
+    Filters out <|endoftext|> token.
+    """
+    state.load()
+    
+    if not text.strip():
+        return go.Figure(), "Enter text to analyze.", ""
+    
+    hidden, tokens, token_strs = get_activations(text)
+    hidden_np = hidden.cpu().numpy()  # [seq_len, d_hidden]
+    
+    # Filter out <|endoftext|> (BOS token)
+    valid_indices = [i for i, t in enumerate(token_strs) if t.strip() not in ["<|endoftext|>", ""]]
+    if not valid_indices:
+        return go.Figure(), "No valid tokens found.", ""
+    
+    filtered_token_strs = [token_strs[i] for i in valid_indices]
+    filtered_hidden = hidden_np[valid_indices]  # [filtered_seq_len, d_hidden]
+    
+    n_tokens = len(filtered_token_strs)
+    
+    # Find all features with activation > threshold
+    max_per_feature = filtered_hidden.max(axis=0)  # [d_hidden]
+    activation_threshold = 0.5
+    activated_mask = max_per_feature > activation_threshold
+    activated_indices = np.where(activated_mask)[0]
+    
+    # Sort by activation strength, take top 25 for visualization
+    sorted_by_activation = activated_indices[np.argsort(max_per_feature[activated_indices])[::-1]]
+    top_feature_indices = sorted_by_activation[:25]
+    
+    total_activated = len(activated_indices)
+    
+    # =================================================================
+    # Generate Model Output
+    # =================================================================
+    with torch.no_grad():
+        input_tokens = state.model.to_tokens(text)
+        generated = state.model.generate(
+            input_tokens,
+            max_new_tokens=30,
+            temperature=0.8,
+            top_p=0.9,
+            stop_at_eos=True,
+        )
+        model_output = state.model.tokenizer.decode(generated[0])
+    
+    # =================================================================
+    # Input → Feature → Output Sankey Diagram
+    # =================================================================
+    
+    sankey_labels = []
+    sankey_source = []
+    sankey_target = []
+    sankey_value = []
+    sankey_colors = []
+    
+    # Add input token nodes (filtered)
+    input_labels = [f"IN: {t.strip()[:12]}" for t in filtered_token_strs]
+    sankey_labels.extend(input_labels)
+    n_input = len(input_labels)
+    
+    # Add feature nodes
+    feature_labels = [get_feature_label(idx)[:25] for idx in top_feature_indices]
+    sankey_labels.extend(feature_labels)
+    n_feature = len(feature_labels)
+    
+    # Add output token nodes (from VocabProj of top features) — batched for speed
+    output_tokens_set = {}
+    feature_to_outputs = get_vocab_projections_batched([int(i) for i in top_feature_indices], top_k=3)
+    for feat_idx in top_feature_indices:
+        for tok, logit in feature_to_outputs.get(int(feat_idx), []):
+            tok_clean = tok.strip()[:12]
+            if tok_clean and tok_clean not in output_tokens_set:
+                output_tokens_set[tok_clean] = logit
+    
+    # Sort output tokens by total logit contribution
+    sorted_outputs = sorted(output_tokens_set.items(), key=lambda x: x[1], reverse=True)[:20]
+    output_labels = [f"OUT: {tok}" for tok, _ in sorted_outputs]
+    sankey_labels.extend(output_labels)
+    
+    # Links: Input tokens → Features (blue)
+    for tok_idx in range(n_tokens):
+        for i, feat_idx in enumerate(top_feature_indices[:15]):
+            act = filtered_hidden[tok_idx, feat_idx]
+            if act > activation_threshold:
+                sankey_source.append(tok_idx)
+                sankey_target.append(n_input + i)
+                sankey_value.append(float(act))
+                sankey_colors.append("rgba(31, 119, 180, 0.5)")
+    
+    # Links: Features → Output tokens (orange)
+    output_label_set = {label: idx for idx, label in enumerate(output_labels)}
+    for i, feat_idx in enumerate(top_feature_indices[:15]):
+        outputs = feature_to_outputs.get(int(feat_idx), [])
+        for tok, logit in outputs:
+            tok_clean = tok.strip()[:12]
+            out_label = f"OUT: {tok_clean}"
+            if out_label in output_label_set:
+                sankey_source.append(n_input + i)
+                sankey_target.append(n_input + n_feature + output_label_set[out_label])
+                sankey_value.append(max(0.5, abs(logit)))
+                sankey_colors.append("rgba(255, 127, 14, 0.5)")
+    
+    sankey_fig = go.Figure(data=[go.Sankey(
+        node=dict(
+            pad=15,
+            thickness=20,
+            line=dict(color="black", width=0.5),
+            label=sankey_labels,
+            color=["#1f77b4"] * n_input + ["#2ca02c"] * n_feature + ["#ff7f0e"] * len(output_labels),
+        ),
+        link=dict(
+            source=sankey_source,
+            target=sankey_target,
+            value=sankey_value,
+            color=sankey_colors,
+        )
+    )])
+    
+    sankey_fig.update_layout(
+        title=f"Circuit Flow ({total_activated} features activated, showing top 25)",
+        height=600,
+        font_size=10,
+    )
+    
+    # =================================================================
+    # Detailed Path Analysis (Markdown)
+    # =================================================================
+    
+    md = f"## Circuit Analysis Details\n\n"
+    md += f"**Total features activated:** {total_activated} (threshold > {activation_threshold})\n\n"
+    
+    md += "### Top Activated Features\n\n"
+    md += "| Rank | Feature | Label | Max Activation | Promotes Tokens |\n"
+    md += "|------|---------|-------|----------------|------------------|\n"
+    
+    for rank, feat_idx in enumerate(top_feature_indices[:15], 1):
+        feat_idx = int(feat_idx)
+        label = get_feature_label(feat_idx)
+        max_act = max_per_feature[feat_idx]
+        outputs = feature_to_outputs.get(feat_idx, [])
+        out_str = ", ".join([f"'{t.strip()}'" for t, _ in outputs[:3]])
+        md += f"| {rank} | {feat_idx} | {label[:30]} | {max_act:.2f} | {out_str} |\n"
+    
+    md += "\n### Input Token → Feature Mapping\n\n"
+    for tok_idx, tok in enumerate(filtered_token_strs[:10]):
+        tok_acts = filtered_hidden[tok_idx]
+        top_for_token = np.argsort(tok_acts)[-5:][::-1]
+        features_str = ", ".join([f"{get_feature_label(int(i))[:20]}({tok_acts[i]:.1f})" for i in top_for_token if tok_acts[i] > 0.1])
+        if features_str:
+            md += f"**'{tok.strip()}'** → {features_str}\n\n"
+    
+    return sankey_fig, md, model_output
+
+
+def analyze_feature_deep(feature_idx: int) -> str:
+    """Deep analysis of a single feature - uses full feature data."""
+    state.load()
+    
+    # Check if feature is labeled
+    label_info = None
+    for f in state.labeled_features:
+        if f["index"] == feature_idx:
+            label_info = f
+            break
+    
+    if label_info:
+        label_text = label_info["label"]
+        confidence = label_info.get("confidence", "unknown")
+    else:
+        label_text = "Unlabelled"
+        confidence = None
+    
+    # Get VocabProj
+    outputs = get_feature_vocab_projection(feature_idx, top_k=10)
+    
+    # Get decoder vector stats
+    decoder_vec = state.sae.decoder.weight[:, feature_idx].detach().cpu().numpy()
+    
+    # Get full feature data (MaxAct examples) if available
+    full_data = state.feature_by_index.get(feature_idx, {})
+    max_act_examples = full_data.get("max_activating_tokens", [])  # fixed key
+    vocab_proj_tokens = full_data.get("vocab_projection", [])       # fixed key
+    frequency = full_data.get("frequency", 0)
+
+    md = f"## Feature {feature_idx} Deep Analysis\n\n"
+    if confidence:
+        md += f"**Label:** {label_text} (confidence: {confidence})\n\n"
+    else:
+        md += f"**Label:** {label_text}\n\n"
+    md += f"**Activation Frequency:** {frequency:.1%} of tokens\n\n"
+
+    md += "### Input Tokens (MaxAct Examples)\n"
+    md += "These input contexts maximally activate this feature:\n\n"
+
+    if max_act_examples:
+        for i, ex in enumerate(max_act_examples[:5], 1):
+            context = ex.get("context", "")
+            token = ex.get("token", "")
+            act = ex.get("activation", 0)
+            if context:
+                md += f"**{i}.** `{context}` (activation: {act:.2f})\n\n"
+            else:
+                md += f"**{i}.** **'{token}'** (activation: {act:.2f})\n\n"
+    else:
+        md += "*No MaxAct examples available*\n\n"
+    
+    md += "### Output Tokens (VocabProj)\n"
+    md += "These tokens are promoted when this feature activates:\n\n"
+    md += "| Token | Logit |\n|-------|-------|\n"
+    for tok, logit in outputs:
+        md += f"| '{tok}' | {logit:.3f} |\n"
+    
+    if vocab_proj_tokens:
+        md += f"\n*From features.json:* {', '.join(vocab_proj_tokens[:10])}\n"
+    
+    md += f"\n### Decoder Vector Stats\n"
+    md += f"- Norm: {np.linalg.norm(decoder_vec):.3f}\n"
+    md += f"- Mean: {decoder_vec.mean():.5f}\n"
+    md += f"- Std: {decoder_vec.std():.5f}\n"
     
     return md
 
@@ -553,54 +688,113 @@ def build_ui():
                 )
             
             # =================================================================
-            # Tab 2: Attribution Graphs
+            # Tab 2: Feature Activations
             # =================================================================
-            with gr.Tab("📊 Attribution Graphs"):
+            with gr.Tab("📊 Feature Activations"):
                 gr.Markdown("""
-                ### Feature Attribution & Visualization
-                Analyze which features activate on your text and how concepts are distributed.
+                ### Feature Activations
+                See which SAE features activate on your input text.
                 """)
                 
-                heatmap_input = gr.Textbox(
+                activation_input = gr.Textbox(
                     label="Input Text",
                     placeholder="Enter text to analyze...",
                     value="The president announced new economic policies today.",
                     lines=2,
                 )
                 
-                analyze_btn = gr.Button("🔍 Analyze", variant="primary")
+                activation_btn = gr.Button("🔍 Analyze", variant="primary")
                 
-                with gr.Row():
-                    with gr.Column():
-                        feature_ranking_plot = gr.Plot(label="Top Feature Activations")
-                    with gr.Column():
-                        concept_pie_plot = gr.Plot(label="Concept Distribution")
-                
-                with gr.Row():
-                    activation_flow_plot = gr.Plot(label="Feature Activation Flow")
-                
-                with gr.Row():
-                    heatmap_plot = gr.Plot(label="Feature × Token Heatmap")
-                
+                feature_ranking_plot = gr.Plot(label="Top Feature Activations")
                 feature_table = gr.Markdown()
                 
-                def on_analyze(text):
+                def on_activation_analyze(text):
                     ranking = create_feature_ranking(text)
-                    pie = create_concept_pie(text)
-                    flow = create_activation_flow(text)
-                    heatmap = create_activation_heatmap(text)
                     table = create_feature_detail_table(text)
-                    return ranking, pie, flow, heatmap, table
+                    return ranking, table
                 
-                analyze_btn.click(
-                    on_analyze,
-                    inputs=[heatmap_input],
-                    outputs=[feature_ranking_plot, concept_pie_plot, activation_flow_plot, 
-                             heatmap_plot, feature_table],
+                activation_btn.click(
+                    on_activation_analyze,
+                    inputs=[activation_input],
+                    outputs=[feature_ranking_plot, feature_table],
                 )
             
             # =================================================================
-            # Tab 3: Feature Browser
+            # Tab 3: Circuit Analysis
+            # =================================================================
+            with gr.Tab("🔬 Circuit Analysis"):
+                gr.Markdown("""
+                ### Circuit Analysis: Input → Features → Output
+                Trace how tokens flow through SAE features to output tokens.
+                
+                **Legend:** 🔵 Blue = Input tokens → Features | 🟠 Orange = Features → Output tokens
+                """)
+                
+                circuit_input = gr.Textbox(
+                    label="Input Text",
+                    placeholder="Enter text to trace through the circuit...",
+                    value="The stock market crashed because investors were worried.",
+                    lines=2,
+                )
+                
+                circuit_analyze_btn = gr.Button("🔬 Analyze Circuit", variant="primary")
+                
+                model_output_box = gr.Textbox(
+                    label="Model Output",
+                    lines=3,
+                    interactive=False,
+                )
+                
+                with gr.Row():
+                    sankey_plot = gr.Plot(label="Input → Features → Output Flow")
+                
+                circuit_details = gr.Markdown()
+                
+                circuit_analyze_btn.click(
+                    analyze_circuit,
+                    inputs=[circuit_input],
+                    outputs=[sankey_plot, circuit_details, model_output_box],
+                )
+            
+            # =================================================================
+            # Tab 4: Feature Deep Dive
+            # =================================================================
+            with gr.Tab("🔍 Feature Deep Dive"):
+                gr.Markdown("""
+                ### Individual Feature Analysis
+                Explore any feature in detail - see what inputs activate it and what outputs it promotes.
+                """)
+                
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        feature_index_input = gr.Number(
+                            value=0,
+                            label="Feature Index (0-8191)",
+                            precision=0,
+                        )
+                        analyze_feature_btn = gr.Button("🔍 Analyze Feature", variant="primary")
+                    
+                    with gr.Column(scale=2):
+                        feature_analysis_output = gr.Markdown()
+                
+                def on_analyze_feature(index_value):
+                    if index_value is None:
+                        return "Please enter a feature index."
+                    
+                    feat_idx = int(index_value)
+                    if feat_idx < 0 or feat_idx >= 8192:
+                        return "Feature index must be between 0 and 8191."
+                    
+                    return analyze_feature_deep(feat_idx)
+                
+                analyze_feature_btn.click(
+                    on_analyze_feature,
+                    inputs=[feature_index_input],
+                    outputs=[feature_analysis_output],
+                )
+            
+            # =================================================================
+            # Tab 5: Feature Browser
             # =================================================================
             with gr.Tab("📚 Feature Browser"):
                 gr.Markdown("""

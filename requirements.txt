@@ -16,7 +16,7 @@ wandb>=0.15.0
 
 # Feature labeling
 python-dotenv>=1.0.0
-openai==0.28.0
+openai>=1.0.0,<1.57.0
 
 # UI / Visualization
 gradio>=4.0.0

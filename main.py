@@ -23,7 +23,7 @@ from config import (
     MODEL_NAME, D_MODEL, TARGET_LAYER, HOOK_TYPE,
     EXPANSION_FACTOR, L1_COEFFICIENT,
     LEARNING_RATE, NUM_EPOCHS, BATCH_SIZE, NUM_SAMPLES,
-    OUTPUT_DIR,
+    OUTPUT_DIR, GHOST_GRAD_COEFFICIENT,
     get_device,
     SparseAutoencoder, ActivationData, MaxActExample, FeatureInfo,
 )
@@ -172,17 +172,29 @@ def train_sae(
             # Forward pass
             output = sae(batch)
             
-            # Ghost gradient loss for dead neurons
+            # Ghost gradient loss for dead neurons (proper reconstruction on residual)
             ghost_loss = torch.tensor(0.0, device=device)
             dead_mask = sae.get_dead_neurons()
             n_dead = dead_mask.sum().item()
-            
+
             if n_dead > 0:
-                residual = batch - output.reconstructed
-                residual_norm = residual.norm(dim=-1, keepdim=True) + 1e-8
-                dead_encoder = sae.encoder.weight[dead_mask]
-                ghost_acts = torch.einsum("bd,nd->bn", residual / residual_norm, dead_encoder)
-                ghost_loss = -ghost_acts.mean() * 0.1
+                residual = (batch - output.reconstructed).detach()  # [B, d_model]
+                W_E_dead = sae.encoder.weight[dead_mask]             # [n_dead, d_model]
+                b_E_dead = sae.encoder.bias[dead_mask]               # [n_dead]
+                W_D_dead = sae.decoder.weight[:, dead_mask].T        # [n_dead, d_model]
+                x_centered = batch - sae.b_pre
+
+                ghost_pre = x_centered @ W_E_dead.T + b_E_dead       # [B, n_dead]
+                ghost_h = torch.relu(ghost_pre)                       # [B, n_dead]
+                ghost_recon = ghost_h @ W_D_dead                      # [B, d_model]
+
+                ghost_norm = ghost_recon.norm(dim=-1, keepdim=True) + 1e-8
+                resid_norm = residual.norm(dim=-1, keepdim=True) + 1e-8
+                scale = (resid_norm / ghost_norm).detach()
+
+                ghost_loss = torch.nn.functional.mse_loss(
+                    ghost_recon * scale, residual
+                ) * GHOST_GRAD_COEFFICIENT
             
             total_loss = output.loss + ghost_loss
             
@@ -223,6 +235,23 @@ def train_sae(
 # =============================================================================
 # Feature Analysis (Input-centric + Output-centric methods from lit review)
 # =============================================================================
+
+def build_context_string(global_token_idx: int, token_ids: torch.Tensor, tokenizer, window: int = 5) -> str:
+    """Build a ±window token context string with [TOKEN] marker around the trigger token."""
+    n = len(token_ids)
+    start = max(0, global_token_idx - window)
+    end = min(n, global_token_idx + window + 1)
+
+    parts = []
+    for pos in range(start, end):
+        tok_str = tokenizer.decode([token_ids[pos].item()])
+        if pos == global_token_idx:
+            parts.append(f"[{tok_str}]")
+        else:
+            parts.append(tok_str)
+
+    return "".join(parts)
+
 
 def analyze_features(
     sae: SparseAutoencoder,
@@ -300,41 +329,54 @@ def analyze_features(
     top_feature_set = set(top_feature_indices)
     print(f"    Analyzing all {num_features_to_analyze} features...")
     
-    # Track top-k activations per feature
+    # Track top-k activations per feature — vectorized across ALL features at once
     topk_per_feature = top_k
-    max_act_values = {idx: torch.full((topk_per_feature,), float('-inf')) for idx in top_feature_indices}
-    max_act_indices = {idx: torch.zeros(topk_per_feature, dtype=torch.long) for idx in top_feature_indices}
-    
+    n_features = len(top_feature_indices)
+    feat_idx_tensor = torch.tensor(top_feature_indices, dtype=torch.long)
+
+    # running_vals[k, f] = k-th largest activation seen so far for feature f
+    running_vals = torch.full((topk_per_feature, n_features), float('-inf'))
+    running_idxs = torch.zeros(topk_per_feature, n_features, dtype=torch.long)
+
     for i in tqdm(range(0, len(activations), BATCH_SIZE), desc="  MaxAct"):
         batch = activations[i:i+BATCH_SIZE].to(device)
         batch_start_idx = i
-        batch_end_idx = min(i + BATCH_SIZE, len(activations))
-        
+        batch_size_actual = batch.shape[0]
+
         # Get mask for this batch (exclude BOS tokens)
-        batch_mask = content_mask[batch_start_idx:batch_end_idx]
-        
+        batch_mask = content_mask[batch_start_idx:batch_start_idx + batch_size_actual]  # [B]
+
         with torch.no_grad():
-            features = sae.encode(batch).cpu()  # [batch_size, d_hidden]
-        
-        # For each feature we're tracking, update its top-k
-        for feat_idx in top_feature_indices:
-            feat_acts = features[:, feat_idx]  # [batch_size]
-            
-            # Mask out BOS token positions (set to -inf so they won't be selected)
-            feat_acts_masked = feat_acts.clone()
-            feat_acts_masked[~batch_mask] = float('-inf')
-            
-            # Combine current batch with existing top-k and keep overall top-k
-            combined_vals = torch.cat([max_act_values[feat_idx], feat_acts_masked])
-            combined_idxs = torch.cat([
-                max_act_indices[feat_idx],
-                torch.arange(batch_start_idx, batch_start_idx + len(feat_acts))
-            ])
-            
-            # Get top-k from combined
-            topk_vals, topk_positions = combined_vals.topk(topk_per_feature)
-            max_act_values[feat_idx] = topk_vals
-            max_act_indices[feat_idx] = combined_idxs[topk_positions]
+            features_all = sae.encode(batch).cpu()  # [B, d_hidden]
+
+        # Extract only the features we care about: [B, n_features]
+        batch_feats = features_all[:, feat_idx_tensor]
+
+        # Mask BOS positions
+        batch_feats[~batch_mask] = float('-inf')
+
+        # Global indices for this batch: [B]
+        global_idxs = torch.arange(batch_start_idx, batch_start_idx + batch_size_actual)
+
+        # Combine with running top-k and keep top-k
+        # combined_vals: [topk + B, n_features], combined_idxs: [topk + B, n_features]
+        combined_vals = torch.cat([running_vals, batch_feats], dim=0)              # [topk+B, n_feat]
+        combined_idxs_global = torch.cat([
+            running_idxs,
+            global_idxs.unsqueeze(1).expand(-1, n_features)                        # [B, n_feat]
+        ], dim=0)
+
+        # topk over the combined dim=0
+        new_vals, new_positions = combined_vals.topk(topk_per_feature, dim=0)     # [topk, n_feat]
+        running_vals = new_vals
+        running_idxs = combined_idxs_global.gather(0, new_positions)
+
+    # Convert back to per-feature dicts expected by downstream code
+    max_act_values = {}
+    max_act_indices = {}
+    for f_pos, feat_idx in enumerate(top_feature_indices):
+        max_act_values[feat_idx] = running_vals[:, f_pos]
+        max_act_indices[feat_idx] = running_idxs[:, f_pos]
     
     # =========================================================================
     # Output-centric: VocabProj - Project decoder vectors onto vocabulary
@@ -363,18 +405,21 @@ def analyze_features(
             act_val = max_act_values[feat_idx][sort_pos].item()
             if act_val <= 0:
                 continue
-            
+
             token_global_idx = max_act_indices[feat_idx][sort_pos].item()
             tok_id = token_ids[token_global_idx].item()
             tok_str = tokenizer.decode([tok_id])
-            
+
             # Deduplicate (same token can appear in multiple positions)
             if tok_str not in seen_tokens:
                 seen_tokens.add(tok_str)
+                ctx = build_context_string(token_global_idx, token_ids, tokenizer)
                 max_act_examples.append(MaxActExample(
                     token=tok_str,
                     token_id=tok_id,
                     activation=act_val,
+                    context=ctx,
+                    global_token_idx=token_global_idx,
                 ))
         
         # VocabProj: tokens this feature promotes (output-centric)
@@ -461,7 +506,13 @@ def save_results(
             "max": f.max_activation,
             # Input-centric: what tokens activate this feature
             "max_activating_tokens": [
-                {"token": ex.token, "token_id": ex.token_id, "activation": ex.activation}
+                {
+                    "token": ex.token,
+                    "token_id": ex.token_id,
+                    "activation": ex.activation,
+                    "context": ex.context,
+                    "global_token_idx": ex.global_token_idx,
+                }
                 for ex in f.max_activating_tokens
             ],
             # Output-centric: what tokens this feature promotes

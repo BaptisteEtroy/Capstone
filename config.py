@@ -40,6 +40,10 @@ OUTPUT_DIR = Path("outputs")
 SAE_PATH = OUTPUT_DIR / "sae.pt"
 FEATURES_PATH = OUTPUT_DIR / "features.json"
 
+# Ghost gradients
+GHOST_GRAD_COEFFICIENT = 0.1
+GHOST_DEAD_THRESHOLD = 1e-4  # raised from 1e-5 to catch more stale neurons
+
 
 # =============================================================================
 # Utility Functions
@@ -82,6 +86,8 @@ class MaxActExample:
     token: str
     token_id: int
     activation: float
+    context: str = ""           # ±5 token window with [TOKEN] marker
+    global_token_idx: int = -1  # position in flat token_ids tensor
 
 
 @dataclass
@@ -187,7 +193,7 @@ class SparseAutoencoder(nn.Module):
             l0_sparsity=l0_sparsity,
         )
     
-    def get_dead_neurons(self, threshold: float = 1e-5) -> torch.Tensor:
+    def get_dead_neurons(self, threshold: float = GHOST_DEAD_THRESHOLD) -> torch.Tensor:
         """Identify neurons that rarely activate."""
         return self.neuron_activity < threshold
     

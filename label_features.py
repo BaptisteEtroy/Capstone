@@ -40,23 +40,32 @@ class LabeledFeature:
 # =============================================================================
 
 def call_openai(prompt: str, model: str = "gpt-4o-mini") -> str:
-    """Call OpenAI API (using v0.28 SDK)."""
+    """Call OpenAI API (using v1.x SDK)."""
     try:
-        import openai
-        openai.api_key = os.environ.get("OPENAI_API_KEY")
-        
-        response = openai.ChatCompletion.create(
+        from openai import OpenAI
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+        response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "You are an expert in mechanistic interpretability of neural networks. Your task is to label features extracted from a Sparse Autoencoder trained on GPT-2."},
-                {"role": "user", "content": prompt}
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert in mechanistic interpretability of neural networks. "
+                        "Your task is to label features extracted from a Sparse Autoencoder (SAE) trained on GPT-2 Medium. "
+                        "MaxAct tokens are real input tokens that triggered the feature (what it detects). "
+                        "VocabProj tokens are output tokens the feature promotes (what it causes). "
+                        "Give specific, concrete labels — avoid vague terms like 'language patterns', 'text features', 'linguistic', or 'general concepts'."
+                    ),
+                },
+                {"role": "user", "content": prompt},
             ],
             temperature=0.3,
-            max_tokens=2000,  # Enough for ~100 features per batch
+            max_tokens=2000,
         )
-        return response["choices"][0]["message"]["content"].strip()
+        return response.choices[0].message.content.strip()
     except ImportError:
-        raise ImportError("Please install openai: pip install openai==0.28.0")
+        raise ImportError("Please install openai: pip install 'openai>=1.0.0'")
     except Exception as e:
         raise RuntimeError(f"OpenAI API error: {e}")
 
@@ -74,36 +83,51 @@ def extract_feature_tokens(feature: Dict[str, Any]) -> tuple:
     if "max_activating_tokens" in feature:
         for item in feature["max_activating_tokens"][:5]:
             if isinstance(item, dict):
-                max_act_tokens.append(item.get("token", ""))
+                max_act_tokens.append((item.get("token", ""), item.get("activation", 0.0), item.get("context", "")))
             else:
-                max_act_tokens.append(str(item))
-    
+                max_act_tokens.append((str(item), 0.0, ""))
+
     vocab_proj_tokens = feature.get("vocab_projection", [])[:5]
     return max_act_tokens, vocab_proj_tokens
 
 
 def build_batch_prompt(features_batch: List[Dict[str, Any]]) -> str:
     """Build a prompt for labeling multiple features at once."""
-    
+
     features_text = ""
     for feature in features_batch:
         max_act_tokens, vocab_proj_tokens = extract_feature_tokens(feature)
+
+        # Format MaxAct entries with activation values and optional context
+        max_act_parts = []
+        for tok, act, ctx in max_act_tokens:
+            entry = f"'{tok}' (act={act:.1f})"
+            if ctx:
+                entry += f" ctx: {ctx}"
+            max_act_parts.append(entry)
+
         features_text += f"""
 ---
 FEATURE {feature['index']} (freq: {feature['frequency']*100:.1f}%)
-MaxAct: {', '.join(repr(t) for t in max_act_tokens) if max_act_tokens else 'No data'}
-VocabProj: {', '.join(repr(t) for t in vocab_proj_tokens) if vocab_proj_tokens else 'No data'}
+MaxAct (triggers): {', '.join(max_act_parts) if max_act_parts else 'No data'}
+VocabProj (promotes): {', '.join(repr(t) for t in vocab_proj_tokens) if vocab_proj_tokens else 'No data'}
 ---
 """
-    
-    prompt = f"""Analyze these neural network features from a Sparse Autoencoder trained on GPT-2.
+
+    prompt = f"""Analyze these neural network features from a Sparse Autoencoder trained on GPT-2 Medium.
 
 For each feature:
-- MaxAct = tokens that TRIGGER the feature (input-centric)
+- MaxAct = tokens (with activation strength) that TRIGGER the feature (input-centric)
 - VocabProj = tokens the feature PROMOTES in output (output-centric)
 
-Label each feature ONLY if MaxAct and VocabProj are semantically coherent (monosemantic).
-Use "UNLABELED" if tokens seem random or incoherent.
+Rules:
+1. Label ONLY if MaxAct and VocabProj are semantically coherent (monosemantic feature).
+2. Use "UNLABELED" if tokens seem random, incoherent, or too mixed.
+3. Be SPECIFIC: use concrete labels like "Python function definitions", "past-tense verbs", "US state names", "sports scores".
+4. AVOID vague labels like "language patterns", "text features", "linguistic structures", "general concepts".
+5. High confidence = both MaxAct and VocabProj clearly share the same theme.
+6. Medium confidence = mostly coherent but some noise.
+7. Low confidence = weak signal, leaning toward UNLABELED.
 
 {features_text}
 
@@ -111,9 +135,10 @@ Respond with EXACTLY one line per feature in this format:
 FEATURE <id>: <LABEL or UNLABELED> | <high/medium/low> | <short reasoning>
 
 Examples:
-FEATURE 123: emotional states | high | Both MaxAct and VocabProj contain emotion words
+FEATURE 123: Python function definitions | high | MaxAct has 'def', 'return', 'class'; VocabProj promotes 'def', 'import'
 FEATURE 456: UNLABELED | low | Tokens appear random with no clear pattern
-FEATURE 789: technology devices | medium | MaxAct has device words, VocabProj partially related"""
+FEATURE 789: US state names | medium | MaxAct has 'Texas', 'Ohio', VocabProj partially related
+FEATURE 101: past-tense irregular verbs | high | MaxAct has 'went', 'knew', 'said'; VocabProj promotes similar past-tense forms"""
 
     return prompt
 
