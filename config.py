@@ -27,11 +27,11 @@ HOOK_TYPE = "resid_post"
 
 # SAE: Standard architecture with L1 regularization (lit review: most effective method)
 EXPANSION_FACTOR = 8  # Hidden dim = 1024 * 8 = 8192 features
-L1_COEFFICIENT = 50  # Aggressive sparsity to hit L0 target of 50-200
+L1_COEFFICIENT = 40   # Compromise: 30 gave L0=354 (too high), 50 gave 36% dead (too many)
 
 # Training
 LEARNING_RATE = 1e-4  # convergence
-NUM_EPOCHS = 3        # Plateau after ~3 epochs anyway
+NUM_EPOCHS = 5        # Extra epochs give ghost grads more time to revive dead neurons
 BATCH_SIZE = 4096
 NUM_SAMPLES = 50_000  # 50k samples (fits in 24GB RAM)
 
@@ -41,8 +41,8 @@ SAE_PATH = OUTPUT_DIR / "sae.pt"
 FEATURES_PATH = OUTPUT_DIR / "features.json"
 
 # Ghost gradients
-GHOST_GRAD_COEFFICIENT = 0.1
-GHOST_DEAD_THRESHOLD = 1e-4  # raised from 1e-5 to catch more stale neurons
+GHOST_GRAD_COEFFICIENT = 0.25  # Increased from 0.1: stronger revival signal for dead neurons
+GHOST_DEAD_THRESHOLD = 1e-5   # Consistent with summary dead-neuron counting (feature_freq < 1e-5)
 
 
 # =============================================================================

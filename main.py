@@ -152,8 +152,9 @@ def train_sae(
     total_steps = len(loader) * num_epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=learning_rate * 0.1)
     
-    # L1 warmup (gradually increase sparsity penalty)
-    l1_warmup_steps = 2000
+    # L1 warmup: reach full L1 by end of epoch 2, so epochs 3-5 converge at full strength.
+    # 5000 was too long (covered 64% of training), causing loss to rise mid-training.
+    l1_warmup_steps = 3000
     
     history = {"loss": [], "reconstruction": [], "sparsity": [], "l0": [], "dead": []}
     global_step = 0
@@ -578,7 +579,7 @@ def main():
     
     print("\n" + "="*60)
     print("  SAE Feature Extraction Pipeline")
-    print("  Model: GPT-2 | Layer: 6 | Hook: resid_post")
+    print(f"  Model: {MODEL_NAME} | Layer: {TARGET_LAYER} | Hook: {HOOK_TYPE}")
     print("="*60)
     
     if args.quick:
