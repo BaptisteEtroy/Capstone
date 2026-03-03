@@ -41,8 +41,13 @@ SAE_PATH = OUTPUT_DIR / "sae.pt"
 FEATURES_PATH = OUTPUT_DIR / "features.json"
 
 # Ghost gradients
-GHOST_GRAD_COEFFICIENT = 0.25  # Increased from 0.1: stronger revival signal for dead neurons
+GHOST_GRAD_COEFFICIENT = 0.25  # Stronger revival signal for dead neurons
 GHOST_DEAD_THRESHOLD = 1e-5   # Consistent with summary dead-neuron counting (feature_freq < 1e-5)
+
+# Neuron resampling (Anthropic-style): reinitialize neurons that ghost grads can't reach.
+# Threshold is 10x ghost grad's — catches "borderline" neurons with low-but-nonzero EMA
+# that still fire on <0.01% of tokens and contribute nothing interpretable.
+RESAMPLE_DEAD_THRESHOLD = 1e-4
 
 
 # =============================================================================
