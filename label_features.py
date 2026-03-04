@@ -130,7 +130,7 @@ def compute_quality_score(feature: Dict[str, Any]) -> float:
 
 def filter_high_quality_features(
     features: List[Dict[str, Any]],
-    min_freq: float = 0.005,   # 0.5%  — exclude near-dead features
+    min_freq: float = 0.002,   # 0.2%  — exclude near-dead features
     max_freq: float = 0.15,    # 15%   — exclude always-on polysemantic features
     min_max_act: int = 3,      # need ≥3 MaxAct examples to assess coherence
     min_vocab_proj: int = 3,   # need ≥3 VocabProj tokens to assess output signal
@@ -181,7 +181,7 @@ BATCH_SIZE = 50  # Features per API call (can go up to ~100)
 
 
 def extract_feature_tokens(feature: Dict[str, Any]) -> tuple:
-    """Extract MaxAct and VocabProj tokens from a feature."""
+    """Extract MaxAct and VocabProj tokens (with logits) from a feature."""
     max_act_tokens = []
     if "max_activating_tokens" in feature:
         for item in feature["max_activating_tokens"][:10]:
@@ -191,7 +191,13 @@ def extract_feature_tokens(feature: Dict[str, Any]) -> tuple:
                 max_act_tokens.append((str(item), 0.0, ""))
 
     vocab_proj_tokens = feature.get("vocab_projection", [])[:10]
-    return max_act_tokens, vocab_proj_tokens
+    vocab_proj_logits = feature.get("vocab_projection_logits", [])[:10]
+
+    # Zip tokens with their logit values; fall back to None if logits not available
+    vocab_proj = list(zip(vocab_proj_tokens, vocab_proj_logits)) if vocab_proj_logits else \
+                 [(t, None) for t in vocab_proj_tokens]
+
+    return max_act_tokens, vocab_proj
 
 
 def build_batch_prompt(features_batch: List[Dict[str, Any]]) -> str:
@@ -209,11 +215,18 @@ def build_batch_prompt(features_batch: List[Dict[str, Any]]) -> str:
                 entry += f" ctx: {ctx}"
             max_act_parts.append(entry)
 
+        vocab_parts = []
+        for tok, logit in vocab_proj_tokens:
+            if logit is not None:
+                vocab_parts.append(f"'{tok}' ({logit:.2f})")
+            else:
+                vocab_parts.append(repr(tok))
+
         features_text += f"""
 ---
 FEATURE {feature['index']} (freq: {feature['frequency']*100:.1f}%)
 MaxAct (triggers): {', '.join(max_act_parts) if max_act_parts else 'No data'}
-VocabProj (promotes): {', '.join(repr(t) for t in vocab_proj_tokens) if vocab_proj_tokens else 'No data'}
+VocabProj (promotes, logit boost): {', '.join(vocab_parts) if vocab_parts else 'No data'}
 ---
 """
 
@@ -286,7 +299,7 @@ def label_features(
     dry_run: bool = False,
     max_features: int = 2000,
     batch_size: int = BATCH_SIZE,
-    min_freq: float = 0.005,
+    min_freq: float = 0.001,
     max_freq: float = 0.15,
     no_filter: bool = False,
 ) -> List[LabeledFeature]:
@@ -377,18 +390,23 @@ def save_labeled_features(
     # Sort by quality score descending so the app shows best features first
     sorted_features = sorted(labeled_features, key=lambda f: f.quality_score, reverse=True)
 
-    data = [
-        {
+    data = []
+    for f in sorted_features:
+        # vocab_proj_tokens is stored as [(token, logit), ...] — split for JSON
+        # Keep vocab_proj_tokens as strings for app.py backwards compatibility
+        vp_tokens = [t[0] if isinstance(t, (list, tuple)) else t for t in f.vocab_proj_tokens]
+        vp_logits = [round(t[1], 4) if isinstance(t, (list, tuple)) and t[1] is not None else None
+                     for t in f.vocab_proj_tokens]
+        data.append({
             "index": f.index,
             "label": f.label,
             "confidence": f.confidence,
             "max_act_tokens": f.max_act_tokens,
-            "vocab_proj_tokens": f.vocab_proj_tokens,
+            "vocab_proj_tokens": vp_tokens,
+            "vocab_proj_logits": vp_logits,
             "reasoning": f.reasoning,
             "quality_score": round(f.quality_score, 4),
-        }
-        for f in sorted_features
-    ]
+        })
 
     with open(output_path, "w") as f:
         json.dump(data, f, indent=2)
@@ -435,8 +453,8 @@ def main():
                         help=f"Features per API call (default: {BATCH_SIZE})")
     parser.add_argument("--output", type=str, default=None,
                         help="Output file path")
-    parser.add_argument("--min-freq", type=float, default=0.005,
-                        help="Min activation frequency to include (default: 0.005 = 0.5%%)")
+    parser.add_argument("--min-freq", type=float, default=0.002,
+                        help="Min activation frequency to include (default: 0.001 = 0.2%%)")
     parser.add_argument("--max-freq", type=float, default=0.15,
                         help="Max activation frequency to include (default: 0.15 = 15%%)")
     parser.add_argument("--no-filter", action="store_true",

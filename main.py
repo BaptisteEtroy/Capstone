@@ -340,6 +340,10 @@ def analyze_features(
     print("  Computing VocabProj (output-centric)...")
     unembed = model.W_U.detach()  # [d_model, vocab_size]
     vocab_logits = decoder_weights.T @ unembed  # [d_hidden, vocab_size]
+    # Subtract per-feature mean so we see what each feature promotes ABOVE its own
+    # baseline. Without this, raw logits are dominated by common subword tokens the
+    # model predicts everywhere (e.g. 'etts', 'arted'), masking the actual signal.
+    vocab_logits = vocab_logits - vocab_logits.mean(dim=-1, keepdim=True)
     top_vocab_values, top_vocab_indices = vocab_logits.topk(top_k, dim=-1)
     
     tokenizer = model.tokenizer
