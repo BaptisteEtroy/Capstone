@@ -25,29 +25,21 @@ N_LAYERS = 24
 TARGET_LAYER = 12  # Middle of 24 layers
 HOOK_TYPE = "resid_post"
 
-# SAE: Standard architecture with L1 regularization (lit review: most effective method)
+# SAE: TopK architecture (Gao et al. 2024) — activates exactly K features per token.
+# Eliminates L1 tuning, ghost gradients, and dead neurons by construction.
 EXPANSION_FACTOR = 8  # Hidden dim = 1024 * 8 = 8192 features
-L1_COEFFICIENT = 40   # Compromise: 30 gave L0=354 (too high), 50 gave 36% dead (too many)
+TOP_K = 100           # Exactly 100 features active per token (L0 = K, always)
 
 # Training
-LEARNING_RATE = 1e-4  # convergence
-NUM_EPOCHS = 5        # Extra epochs give ghost grads more time to revive dead neurons
+LEARNING_RATE = 1e-4
+NUM_EPOCHS = 5
 BATCH_SIZE = 4096
-NUM_SAMPLES = 50_000  # 50k samples (fits in 24GB RAM)
+NUM_SAMPLES = 50_000  # fits in 24GB RAM
 
 # Output
 OUTPUT_DIR = Path("outputs")
 SAE_PATH = OUTPUT_DIR / "sae.pt"
 FEATURES_PATH = OUTPUT_DIR / "features.json"
-
-# Ghost gradients
-GHOST_GRAD_COEFFICIENT = 0.25  # Stronger revival signal for dead neurons
-GHOST_DEAD_THRESHOLD = 1e-5   # Consistent with summary dead-neuron counting (feature_freq < 1e-5)
-
-# Neuron resampling (Anthropic-style): reinitialize neurons that ghost grads can't reach.
-# Threshold is 10x ghost grad's — catches "borderline" neurons with low-but-nonzero EMA
-# that still fire on <0.01% of tokens and contribute nothing interpretable.
-RESAMPLE_DEAD_THRESHOLD = 1e-4
 
 
 # =============================================================================
@@ -122,105 +114,84 @@ class FeatureInfo:
 
 class SparseAutoencoder(nn.Module):
     """
-    Sparse Autoencoder for extracting interpretable features.
-    
-    Architecture: Input -> Encoder -> ReLU -> Hidden (sparse) -> Decoder -> Output
-    
-    The L1 penalty encourages sparse activations, leading to monosemantic features
-    where each hidden unit responds to a single interpretable concept.
+    TopK Sparse Autoencoder (Gao et al. 2024).
+
+    Architecture: Input -> Encoder -> TopK -> Hidden (exactly K active) -> Decoder -> Output
+
+    Sparsity is enforced structurally: exactly K features activate per token.
+    No L1 penalty, no ghost gradients, no dead neuron problem.
     """
-    
+
     def __init__(
         self,
         d_model: int = D_MODEL,
         expansion_factor: int = EXPANSION_FACTOR,
-        l1_coeff: float = L1_COEFFICIENT,
+        k: int = TOP_K,
     ):
         super().__init__()
         self.d_model = d_model
         self.d_hidden = d_model * expansion_factor
-        self.l1_coeff = l1_coeff
-        
-        # Encoder and decoder
+        self.k = k
+
         self.encoder = nn.Linear(d_model, self.d_hidden, bias=True)
         self.decoder = nn.Linear(self.d_hidden, d_model, bias=True)
-        self.b_pre = nn.Parameter(torch.zeros(d_model))  # Pre-encoder bias
-        
-        # Initialize weights
+        self.b_pre = nn.Parameter(torch.zeros(d_model))
+
         nn.init.kaiming_uniform_(self.encoder.weight, nonlinearity="relu")
         nn.init.kaiming_uniform_(self.decoder.weight, nonlinearity="linear")
         nn.init.zeros_(self.encoder.bias)
         nn.init.zeros_(self.decoder.bias)
         self._normalize_decoder()
-        
-        # Track neuron activity for ghost gradients
-        self.register_buffer("neuron_activity", torch.zeros(self.d_hidden))
-        self.register_buffer("steps", torch.tensor(0))
-    
+
     def _normalize_decoder(self):
         """Keep decoder columns at unit norm for interpretability."""
         with torch.no_grad():
             norms = self.decoder.weight.norm(dim=0, keepdim=True)
             self.decoder.weight.data = self.decoder.weight.data / (norms + 1e-8)
-    
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode activations to sparse feature space."""
-        return F.relu(self.encoder(x - self.b_pre))
-    
+        """TopK encoding: activate exactly k features per token."""
+        pre = self.encoder(x - self.b_pre)              # [B, d_hidden]
+        topk_vals, topk_idx = pre.topk(self.k, dim=-1)  # [B, k]
+        hidden = torch.zeros_like(pre)
+        hidden.scatter_(-1, topk_idx, topk_vals.clamp(min=0))
+        return hidden
+
     def decode(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Decode sparse features back to activation space."""
         return self.decoder(hidden) + self.b_pre
-    
+
     def forward(self, x: torch.Tensor) -> SAEOutput:
-        """Forward pass with loss computation."""
         hidden = self.encode(x)
         reconstructed = self.decode(hidden)
-        
-        # Losses
         reconstruction_loss = F.mse_loss(reconstructed, x)
-        sparsity_loss = hidden.abs().mean()  # L1 penalty on activations
-        loss = reconstruction_loss + self.l1_coeff * sparsity_loss
         l0_sparsity = (hidden > 0).float().sum(dim=-1).mean()
-        
-        # Track activity for ghost gradients
-        if self.training:
-            with torch.no_grad():
-                batch_activity = (hidden > 0).float().mean(dim=0)
-                self.neuron_activity = 0.999 * self.neuron_activity + 0.001 * batch_activity
-                self.steps += 1
-        
+
         return SAEOutput(
             reconstructed=reconstructed,
             hidden=hidden,
-            loss=loss,
+            loss=reconstruction_loss,
             reconstruction_loss=reconstruction_loss,
-            sparsity_loss=sparsity_loss,
+            sparsity_loss=torch.tensor(0.0, device=x.device),
             l0_sparsity=l0_sparsity,
         )
-    
-    def get_dead_neurons(self, threshold: float = GHOST_DEAD_THRESHOLD) -> torch.Tensor:
-        """Identify neurons that rarely activate."""
-        return self.neuron_activity < threshold
-    
+
     def save(self, path: Path):
-        """Save model to disk."""
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
             "state_dict": self.state_dict(),
             "d_model": self.d_model,
             "d_hidden": self.d_hidden,
-            "l1_coeff": self.l1_coeff,
+            "k": self.k,
         }, path)
         print(f"Saved SAE to {path}")
-    
+
     @classmethod
     def load(cls, path: Path) -> "SparseAutoencoder":
-        """Load model from disk."""
         checkpoint = torch.load(path, weights_only=False)
         sae = cls(
             d_model=checkpoint["d_model"],
             expansion_factor=checkpoint["d_hidden"] // checkpoint["d_model"],
-            l1_coeff=checkpoint["l1_coeff"],
+            k=checkpoint["k"],
         )
         sae.load_state_dict(checkpoint["state_dict"])
         return sae

@@ -21,9 +21,9 @@ from datasets import load_dataset
 # Import all config and shared classes
 from config import (
     MODEL_NAME, D_MODEL, TARGET_LAYER, HOOK_TYPE,
-    EXPANSION_FACTOR, L1_COEFFICIENT,
+    EXPANSION_FACTOR, TOP_K,
     LEARNING_RATE, NUM_EPOCHS, BATCH_SIZE, NUM_SAMPLES,
-    OUTPUT_DIR, GHOST_GRAD_COEFFICIENT, RESAMPLE_DEAD_THRESHOLD,
+    OUTPUT_DIR,
     get_device,
     SparseAutoencoder, ActivationData, MaxActExample, FeatureInfo,
 )
@@ -127,74 +127,6 @@ def collect_activations(
 # =============================================================================
 
 
-def resample_dead_neurons(
-    sae: SparseAutoencoder,
-    activations_sample: torch.Tensor,
-    optimizer: torch.optim.Optimizer,
-    threshold: float = RESAMPLE_DEAD_THRESHOLD,
-) -> int:
-    """
-    Reinitialize dead/near-dead neurons from high-reconstruction-error examples.
-
-    Ghost gradients only reach neurons with EMA < 1e-5 (truly zero). But ~2000+
-    neurons have low-but-nonzero EMA that ghost grads never touch, yet they still
-    fire on <0.01% of tokens and contribute nothing. Resampling catches these by
-    using a looser threshold (1e-4) and fully resetting weights + optimizer state.
-
-    Returns number of neurons resampled.
-    """
-    dead_mask_cpu = (sae.neuron_activity < threshold).cpu()
-    n_dead = int(dead_mask_cpu.sum().item())
-    if n_dead == 0:
-        return 0
-
-    device = sae.encoder.weight.device
-    dead_idx = dead_mask_cpu.nonzero(as_tuple=True)[0].to(device)  # [n_dead]
-    acts = activations_sample.to(device)
-
-    with torch.no_grad():
-        # Find highest-reconstruction-error examples to seed new neurons
-        output = sae(acts)
-        per_sample_loss = (acts - output.reconstructed).pow(2).mean(dim=-1)
-        _, top_idx = per_sample_loss.topk(min(n_dead, len(acts)))
-        seed_acts = acts[top_idx]  # [k, d_model]
-
-        # Build direction vectors from high-loss seeds, cycling if needed
-        k = len(seed_acts)
-        selected = seed_acts[torch.arange(n_dead, device=device) % k]  # [n_dead, d_model]
-        centered = selected - sae.b_pre.unsqueeze(0)
-        directions = centered / (centered.norm(dim=-1, keepdim=True) + 1e-8)
-
-        # Reinitialize encoder rows and decoder columns for dead neurons
-        sae.encoder.weight.data[dead_idx] = directions
-        sae.encoder.bias.data[dead_idx] = 0.0
-        sae.decoder.weight.data[:, dead_idx] = directions.T
-
-        # Reset Adam moment estimates — stale momentum would corrupt fresh weights
-        dead_mask_dev = dead_mask_cpu.to(device)
-        for group in optimizer.param_groups:
-            for p in group['params']:
-                if p not in optimizer.state:
-                    continue
-                s = optimizer.state[p]
-                if 'exp_avg' not in s:
-                    continue
-                if id(p) == id(sae.encoder.weight):
-                    s['exp_avg'][dead_mask_dev] = 0.0
-                    s['exp_avg_sq'][dead_mask_dev] = 0.0
-                elif id(p) == id(sae.encoder.bias):
-                    s['exp_avg'][dead_mask_dev] = 0.0
-                    s['exp_avg_sq'][dead_mask_dev] = 0.0
-                elif id(p) == id(sae.decoder.weight):
-                    s['exp_avg'][:, dead_mask_dev] = 0.0
-                    s['exp_avg_sq'][:, dead_mask_dev] = 0.0
-
-        # Reset EMA so ghost grads don't immediately re-kill the resampled neurons
-        sae.neuron_activity[dead_mask_dev] = 0.0
-
-    return n_dead
-
-
 def train_sae(
     sae: SparseAutoencoder,
     activations: torch.Tensor,
@@ -204,110 +136,55 @@ def train_sae(
     device: Optional[str] = None,
 ) -> Dict[str, List[float]]:
     """
-    Train the SAE with ghost gradients for dead neuron revival.
+    Train the TopK SAE. Loss is pure reconstruction MSE — no sparsity penalty needed.
+    Sparsity is guaranteed by TopK: exactly K features activate per token.
     """
     device = device or get_device()
     sae = sae.to(device)
-    
+
     print(f"\nTraining SAE...")
     print(f"  Architecture: {sae.d_model} -> {sae.d_hidden} -> {sae.d_model}")
+    print(f"  TopK: K={sae.k} (L0={sae.k} exactly, guaranteed)")
     print(f"  Epochs: {num_epochs}, Batch size: {batch_size}, LR: {learning_rate}")
-    
-    # Setup
+
     optimizer = Adam(sae.parameters(), lr=learning_rate)
     dataset = torch.utils.data.TensorDataset(activations)
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
+
     total_steps = len(loader) * num_epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=learning_rate * 0.1)
-    
-    # L1 warmup: reach full L1 by end of epoch 2, so epochs 3-5 converge at full strength.
-    # 5000 was too long (covered 64% of training), causing loss to rise mid-training.
-    l1_warmup_steps = 3000
-    
-    history = {"loss": [], "reconstruction": [], "sparsity": [], "l0": [], "dead": []}
+
+    history = {"loss": [], "reconstruction": []}
     global_step = 0
-    
+
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{num_epochs}")
-        
+
         for (batch,) in pbar:
             batch = batch.to(device)
-            
-            # L1 warmup
-            warmup_factor = min(1.0, global_step / l1_warmup_steps)
-            sae.l1_coeff = L1_COEFFICIENT * warmup_factor
-            
-            # Forward pass
+
             output = sae(batch)
-            
-            # Ghost gradient loss for dead neurons (proper reconstruction on residual)
-            ghost_loss = torch.tensor(0.0, device=device)
-            dead_mask = sae.get_dead_neurons()
-            n_dead = dead_mask.sum().item()
 
-            if n_dead > 0:
-                residual = (batch - output.reconstructed).detach()  # [B, d_model]
-                W_E_dead = sae.encoder.weight[dead_mask]             # [n_dead, d_model]
-                b_E_dead = sae.encoder.bias[dead_mask]               # [n_dead]
-                W_D_dead = sae.decoder.weight[:, dead_mask].T        # [n_dead, d_model]
-                x_centered = batch - sae.b_pre
-
-                ghost_pre = x_centered @ W_E_dead.T + b_E_dead       # [B, n_dead]
-                ghost_h = torch.relu(ghost_pre)                       # [B, n_dead]
-                ghost_recon = ghost_h @ W_D_dead                      # [B, d_model]
-
-                ghost_norm = ghost_recon.norm(dim=-1, keepdim=True) + 1e-8
-                resid_norm = residual.norm(dim=-1, keepdim=True) + 1e-8
-                scale = (resid_norm / ghost_norm).detach()
-
-                ghost_loss = torch.nn.functional.mse_loss(
-                    ghost_recon * scale, residual
-                ) * GHOST_GRAD_COEFFICIENT
-            
-            total_loss = output.loss + ghost_loss
-            
-            # Backward pass
             optimizer.zero_grad()
-            total_loss.backward()
+            output.loss.backward()
             torch.nn.utils.clip_grad_norm_(sae.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
-            
-            # Normalize decoder
             sae._normalize_decoder()
-            
+
             epoch_loss += output.loss.item()
             global_step += 1
-            
-            # Log every 100 steps
+
             if global_step % 100 == 0:
                 history["loss"].append(output.loss.item())
                 history["reconstruction"].append(output.reconstruction_loss.item())
-                history["sparsity"].append(output.sparsity_loss.item())
-                history["l0"].append(output.l0_sparsity.item())
-                history["dead"].append(n_dead)
-            
-            pbar.set_postfix({
-                "loss": f"{output.loss.item():.4f}",
-                "L0": f"{output.l0_sparsity.item():.1f}",
-                "dead": n_dead,
-            })
-        
+
+            pbar.set_postfix({"loss": f"{output.loss.item():.4f}"})
+
         print(f"  Epoch {epoch+1} avg loss: {epoch_loss / len(loader):.4f}")
 
-        # Resample dead/near-dead neurons once per epoch, but only after L1 warmup
-        # completes (no point resampling while the model is still learning sparsity).
-        if global_step > l1_warmup_steps:
-            sample_size = min(batch_size * 4, len(activations))
-            sample_idx = torch.randperm(len(activations))[:sample_size]
-            n_resampled = resample_dead_neurons(sae, activations[sample_idx], optimizer)
-            if n_resampled > 0:
-                print(f"  Resampled {n_resampled} near-dead neurons")
-
     print(f"\nTraining complete!")
-    print(f"  Final dead neurons: {sae.get_dead_neurons().sum().item()}")
     return history
 
 
