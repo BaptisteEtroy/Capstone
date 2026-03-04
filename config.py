@@ -29,6 +29,7 @@ HOOK_TYPE = "resid_post"
 # Eliminates L1 tuning, ghost gradients, and dead neurons by construction.
 EXPANSION_FACTOR = 8  # Hidden dim = 1024 * 8 = 8192 features
 TOP_K = 100           # Exactly 100 features active per token (L0 = K, always)
+AUX_COEFF = 1 / 32   # Auxiliary loss weight (Gao et al. 2024): gives dead features gradient signal
 
 # Training
 LEARNING_RATE = 1e-4
@@ -127,11 +128,13 @@ class SparseAutoencoder(nn.Module):
         d_model: int = D_MODEL,
         expansion_factor: int = EXPANSION_FACTOR,
         k: int = TOP_K,
+        aux_coeff: float = AUX_COEFF,
     ):
         super().__init__()
         self.d_model = d_model
         self.d_hidden = d_model * expansion_factor
         self.k = k
+        self.aux_coeff = aux_coeff
 
         self.encoder = nn.Linear(d_model, self.d_hidden, bias=True)
         self.decoder = nn.Linear(self.d_hidden, d_model, bias=True)
@@ -161,17 +164,34 @@ class SparseAutoencoder(nn.Module):
         return self.decoder(hidden) + self.b_pre
 
     def forward(self, x: torch.Tensor) -> SAEOutput:
-        hidden = self.encode(x)
+        pre = self.encoder(x - self.b_pre)              # [B, d_hidden]
+        topk_vals, topk_idx = pre.topk(self.k, dim=-1)  # [B, k]
+        hidden = torch.zeros_like(pre)
+        hidden.scatter_(-1, topk_idx, topk_vals.clamp(min=0))
         reconstructed = self.decode(hidden)
         reconstruction_loss = F.mse_loss(reconstructed, x)
         l0_sparsity = (hidden > 0).float().sum(dim=-1).mean()
 
+        # Auxiliary loss (Gao et al. 2024): give non-top-K features a gradient by
+        # having them reconstruct the residual. Prevents dead features without
+        # affecting the quality of top-K features (coeff is small, residual detached).
+        aux_loss = torch.tensor(0.0, device=x.device)
+        if self.training and self.aux_coeff > 0:
+            pre_aux = pre.clone()
+            pre_aux.scatter_(-1, topk_idx, -1e9)          # mask out main top-K
+            aux_vals, aux_idx = pre_aux.topk(self.k, dim=-1)
+            aux_hidden = torch.zeros_like(pre)
+            aux_hidden.scatter_(-1, aux_idx, aux_vals.clamp(min=0))
+            residual = (x - reconstructed).detach()       # no gradient to main path
+            aux_recon = self.decode(aux_hidden)
+            aux_loss = F.mse_loss(aux_recon, residual) * self.aux_coeff
+
         return SAEOutput(
             reconstructed=reconstructed,
             hidden=hidden,
-            loss=reconstruction_loss,
+            loss=reconstruction_loss + aux_loss,
             reconstruction_loss=reconstruction_loss,
-            sparsity_loss=torch.tensor(0.0, device=x.device),
+            sparsity_loss=aux_loss,
             l0_sparsity=l0_sparsity,
         )
 
@@ -182,6 +202,7 @@ class SparseAutoencoder(nn.Module):
             "d_model": self.d_model,
             "d_hidden": self.d_hidden,
             "k": self.k,
+            "aux_coeff": self.aux_coeff,
         }, path)
         print(f"Saved SAE to {path}")
 
@@ -192,6 +213,7 @@ class SparseAutoencoder(nn.Module):
             d_model=checkpoint["d_model"],
             expansion_factor=checkpoint["d_hidden"] // checkpoint["d_model"],
             k=checkpoint["k"],
+            aux_coeff=checkpoint.get("aux_coeff", AUX_COEFF),
         )
         sae.load_state_dict(checkpoint["state_dict"])
         return sae

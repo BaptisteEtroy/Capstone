@@ -81,13 +81,13 @@ def extract_feature_tokens(feature: Dict[str, Any]) -> tuple:
     """Extract MaxAct and VocabProj tokens from a feature."""
     max_act_tokens = []
     if "max_activating_tokens" in feature:
-        for item in feature["max_activating_tokens"][:5]:
+        for item in feature["max_activating_tokens"][:10]:
             if isinstance(item, dict):
                 max_act_tokens.append((item.get("token", ""), item.get("activation", 0.0), item.get("context", "")))
             else:
                 max_act_tokens.append((str(item), 0.0, ""))
 
-    vocab_proj_tokens = feature.get("vocab_projection", [])[:5]
+    vocab_proj_tokens = feature.get("vocab_projection", [])[:10]
     return max_act_tokens, vocab_proj_tokens
 
 
@@ -301,7 +301,7 @@ def main():
                         help="OpenAI model to use (default: gpt-4o-mini)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview features without API calls")
-    parser.add_argument("--max-features", type=int, default=1000,
+    parser.add_argument("--max-features", type=int, default=2000,
                         help="Maximum features to label")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
                         help=f"Features per API call (default: {BATCH_SIZE})")

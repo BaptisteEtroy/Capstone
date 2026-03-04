@@ -815,8 +815,12 @@ def build_ui():
                     md = "| Index | Label | Confidence | MaxAct Tokens | VocabProj Tokens |\n"
                     md += "|-------|-------|------------|---------------|------------------|\n"
                     for f in sorted_features[:100]:
-                        max_act = ", ".join(f.get("max_act_tokens", [])[:3])
-                        vocab = ", ".join(f.get("vocab_proj_tokens", [])[:3])
+                        # max_act_tokens are stored as [token, activation, context] tuples
+                        max_act = ", ".join(
+                            t[0] if isinstance(t, (list, tuple)) else str(t)
+                            for t in f.get("max_act_tokens", [])[:3]
+                        )
+                        vocab = ", ".join(str(t) for t in f.get("vocab_proj_tokens", [])[:3])
                         md += f"| {f['index']} | {f['label'][:25]} | {f['confidence']} | {max_act[:30]} | {vocab[:30]} |\n"
                     return md
                 
