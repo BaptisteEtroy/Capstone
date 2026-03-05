@@ -35,7 +35,7 @@ AUX_COEFF = 1 / 32   # Auxiliary loss weight (Gao et al. 2024): gives dead featu
 LEARNING_RATE = 1e-4
 NUM_EPOCHS = 5
 BATCH_SIZE = 4096
-NUM_SAMPLES = 100_000  # fits in 24GB RAM
+NUM_SAMPLES = 100_000
 
 # Output
 OUTPUT_DIR = Path("outputs")

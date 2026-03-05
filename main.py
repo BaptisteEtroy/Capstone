@@ -53,82 +53,77 @@ def collect_activations(
     num_samples: int = NUM_SAMPLES,
     batch_size: int = 32,
     max_tokens: int = 128,
-    chunk_size: int = 25_000,  # Save to disk every 25k samples to avoid OOM
-) -> ActivationData:
+    chunk_size: int = 5_000,  # ~2.6 GB per chunk at 128 tokens × 1024 dims
+) -> tuple:
     """
-    Collect residual stream activations from GPT-2 layer 6.
-    
-    Uses OpenWebText dataset for diverse text inputs.
-    Returns both activations and corresponding token IDs for MaxAct analysis.
-    
-    For large datasets (>50k), saves intermediate chunks to disk to avoid OOM.
+    Collect residual stream activations from GPT-2 layer 12.
+
+    Saves activation chunks to disk to stay within RAM limits.
+    Token IDs (~100 MB total) are kept in memory for MaxAct context building.
+
+    Returns:
+        token_ids   : torch.Tensor [n_tokens]  — all token IDs in RAM
+        chunk_files : List[Path]               — activation chunks on disk
     """
     import gc
-    
+
     hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
+    chunks_dir = OUTPUT_DIR / "chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nCollecting activations from {hook_point}...")
-    print(f"  Samples: {num_samples}, Batch size: {batch_size}")
-    if num_samples > chunk_size:
-        print(f"  Chunked mode: saving every {chunk_size} samples to avoid OOM")
-    
-    # Load dataset
+    print(f"  Samples: {num_samples}, Batch size: {batch_size}, Chunk size: {chunk_size}")
+
     dataset = load_dataset("openwebtext", split="train", streaming=True)
-    
-    all_activations = []
-    all_token_ids = []
+
+    all_activations = []   # accumulate within current chunk
+    all_token_ids = []     # all token IDs (kept in RAM — small)
     batch = []
     count = 0
     chunk_idx = 0
     chunk_files = []
-    
+
     pbar = tqdm(total=num_samples, desc="Collecting")
-    
+
     for item in dataset:
         text = item.get("text", "")
         if not text.strip():
             continue
-        
-        batch.append(text[:max_tokens * 4])  # Rough char limit
+
+        batch.append(text[:max_tokens * 4])
         count += 1
         pbar.update(1)
-        
+
         if len(batch) >= batch_size:
-            # Tokenize and run
             tokens = model.to_tokens(batch)
             if tokens.shape[1] > max_tokens:
                 tokens = tokens[:, :max_tokens]
-            
+
             _, cache = model.run_with_cache(tokens, names_filter=[hook_point])
             acts = cache[hook_point].reshape(-1, D_MODEL).cpu()
             all_activations.append(acts)
-            
-            # Store flattened token IDs (matches activation shape)
             all_token_ids.append(tokens.reshape(-1).cpu())
-            
+
             del cache
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             batch = []
-        
-        # Save chunk to disk if we've collected enough (prevents OOM)
+
+        # Flush chunk to disk — never merge into one giant tensor
         if count % chunk_size == 0 and count > 0 and all_activations:
             chunk_acts = torch.cat(all_activations, dim=0)
-            chunk_ids = torch.cat(all_token_ids, dim=0)
-            chunk_path = OUTPUT_DIR / f"chunk_{chunk_idx}.pt"
-            torch.save({"activations": chunk_acts, "token_ids": chunk_ids}, chunk_path)
+            chunk_path = chunks_dir / f"chunk_{chunk_idx}.pt"
+            torch.save(chunk_acts, chunk_path)
             chunk_files.append(chunk_path)
-            print(f"\n  Saved chunk {chunk_idx} ({chunk_acts.shape[0]} tokens) to {chunk_path}")
-            
-            # Clear memory
-            del all_activations, all_token_ids, chunk_acts, chunk_ids
+            print(f"\n  Saved chunk {chunk_idx} ({chunk_acts.shape[0]:,} tokens) → {chunk_path}")
+
+            del all_activations, chunk_acts
             all_activations = []
-            all_token_ids = []
             gc.collect()
             chunk_idx += 1
-        
+
         if count >= num_samples:
             break
-    
+
     # Process remaining batch
     if batch:
         tokens = model.to_tokens(batch)
@@ -138,41 +133,25 @@ def collect_activations(
         acts = cache[hook_point].reshape(-1, D_MODEL).cpu()
         all_activations.append(acts)
         all_token_ids.append(tokens.reshape(-1).cpu())
-    
+        del cache
+
     pbar.close()
-    
-    # If we saved chunks, merge them
-    if chunk_files:
-        # Save final partial chunk if any
-        if all_activations:
-            chunk_acts = torch.cat(all_activations, dim=0)
-            chunk_ids = torch.cat(all_token_ids, dim=0)
-            chunk_path = OUTPUT_DIR / f"chunk_{chunk_idx}.pt"
-            torch.save({"activations": chunk_acts, "token_ids": chunk_ids}, chunk_path)
-            chunk_files.append(chunk_path)
-            del all_activations, all_token_ids
-            gc.collect()
-        
-        # Merge all chunks
-        print(f"\n  Merging {len(chunk_files)} chunks...")
-        all_acts = []
-        all_ids = []
-        for chunk_path in chunk_files:
-            data = torch.load(chunk_path)
-            all_acts.append(data["activations"])
-            all_ids.append(data["token_ids"])
-            chunk_path.unlink()  # Delete chunk file after loading
-        
-        activations = torch.cat(all_acts, dim=0)
-        token_ids = torch.cat(all_ids, dim=0)
-        del all_acts, all_ids
+
+    # Save final (possibly partial) chunk
+    if all_activations:
+        chunk_acts = torch.cat(all_activations, dim=0)
+        chunk_path = OUTPUT_DIR / f"chunk_{chunk_idx}.pt"
+        torch.save(chunk_acts, chunk_path)
+        chunk_files.append(chunk_path)
+        print(f"\n  Saved chunk {chunk_idx} ({chunk_acts.shape[0]:,} tokens) → {chunk_path}")
+        del all_activations, chunk_acts
         gc.collect()
-    else:
-        activations = torch.cat(all_activations, dim=0)
-        token_ids = torch.cat(all_token_ids, dim=0)
-    
-    print(f"  Collected {activations.shape[0]:,} token activations")
-    return ActivationData(activations=activations, token_ids=token_ids)
+
+    token_ids = torch.cat(all_token_ids, dim=0)
+    n_tokens = sum(torch.load(p).shape[0] for p in chunk_files)
+    print(f"  Collected {n_tokens:,} token activations across {len(chunk_files)} chunks")
+    print(f"  Token IDs in RAM: {token_ids.shape[0]:,} ({token_ids.nbytes / 1e6:.1f} MB)")
+    return token_ids, chunk_files
 
 
 # =============================================================================
@@ -182,29 +161,37 @@ def collect_activations(
 
 def train_sae(
     sae: SparseAutoencoder,
-    activations: torch.Tensor,
+    chunk_files: List[Path],
     num_epochs: int = NUM_EPOCHS,
     batch_size: int = BATCH_SIZE,
     learning_rate: float = LEARNING_RATE,
     device: Optional[str] = None,
 ) -> Dict[str, List[float]]:
     """
-    Train the TopK SAE. Loss is pure reconstruction MSE — no sparsity penalty needed.
-    Sparsity is guaranteed by TopK: exactly K features activate per token.
+    Train the TopK SAE on chunked activations stored on disk.
+
+    Loads one chunk at a time — peak RAM = one chunk + SAE weights.
+    Chunks are shuffled each epoch for better training diversity.
     """
+    import gc
+    import random
+
     device = device or get_device()
     sae = sae.to(device)
+
+    # Estimate total steps for scheduler (use first chunk size as proxy)
+    first_chunk = torch.load(chunk_files[0])
+    steps_per_chunk = (first_chunk.shape[0] + batch_size - 1) // batch_size
+    del first_chunk
+    total_steps = steps_per_chunk * len(chunk_files) * num_epochs
 
     print(f"\nTraining SAE...")
     print(f"  Architecture: {sae.d_model} -> {sae.d_hidden} -> {sae.d_model}")
     print(f"  TopK: K={sae.k} (L0={sae.k} exactly, guaranteed)")
     print(f"  Epochs: {num_epochs}, Batch size: {batch_size}, LR: {learning_rate}")
+    print(f"  Chunks: {len(chunk_files)} (loaded one at a time)")
 
     optimizer = Adam(sae.parameters(), lr=learning_rate)
-    dataset = torch.utils.data.TensorDataset(activations)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    total_steps = len(loader) * num_epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=learning_rate * 0.1)
 
     history = {"loss": [], "reconstruction": []}
@@ -212,30 +199,43 @@ def train_sae(
 
     for epoch in range(num_epochs):
         epoch_loss = 0.0
-        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        epoch_steps = 0
 
-        for (batch,) in pbar:
-            batch = batch.to(device)
+        # Shuffle chunk order each epoch
+        shuffled_chunks = chunk_files.copy()
+        random.shuffle(shuffled_chunks)
 
-            output = sae(batch)
+        for chunk_path in shuffled_chunks:
+            activations = torch.load(chunk_path)
+            dataset = torch.utils.data.TensorDataset(activations)
+            loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-            optimizer.zero_grad()
-            output.loss.backward()
-            torch.nn.utils.clip_grad_norm_(sae.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
-            sae._normalize_decoder()
+            pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{num_epochs} [{chunk_path.name}]")
+            for (batch,) in pbar:
+                batch = batch.to(device)
+                output = sae(batch)
 
-            epoch_loss += output.loss.item()
-            global_step += 1
+                optimizer.zero_grad()
+                output.loss.backward()
+                torch.nn.utils.clip_grad_norm_(sae.parameters(), max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
+                sae._normalize_decoder()
 
-            if global_step % 100 == 0:
-                history["loss"].append(output.loss.item())
-                history["reconstruction"].append(output.reconstruction_loss.item())
+                epoch_loss += output.loss.item()
+                epoch_steps += 1
+                global_step += 1
 
-            pbar.set_postfix({"loss": f"{output.loss.item():.4f}"})
+                if global_step % 100 == 0:
+                    history["loss"].append(output.loss.item())
+                    history["reconstruction"].append(output.reconstruction_loss.item())
 
-        print(f"  Epoch {epoch+1} avg loss: {epoch_loss / len(loader):.4f}")
+                pbar.set_postfix({"loss": f"{output.loss.item():.4f}"})
+
+            del activations, dataset, loader
+            gc.collect()
+
+        print(f"  Epoch {epoch+1} avg loss: {epoch_loss / epoch_steps:.4f}")
 
     print(f"\nTraining complete!")
     return history
@@ -265,122 +265,110 @@ def build_context_string(global_token_idx: int, token_ids: torch.Tensor, tokeniz
 def analyze_features(
     sae: SparseAutoencoder,
     model: HookedTransformer,
-    activation_data: ActivationData,
+    token_ids: torch.Tensor,
+    chunk_files: List[Path],
     top_k: int = 20,
     device: Optional[str] = None,
 ) -> List[FeatureInfo]:
     """
     Analyze learned features using combined input/output-centric methods.
-    
-    Input-centric (MaxAct): Find the actual input tokens that maximally activate 
-    each feature. This tells us what concepts/patterns the feature detects.
-    
-    Output-centric (VocabProj): Project decoder vectors onto unembedding matrix
-    to see what tokens the feature promotes in the output. This tells us
-    what effect the feature has on model predictions.
-    
-    The combination captures both WHAT TRIGGERS features AND THEIR EFFECT on outputs.
+
+    Processes activation chunks from disk one at a time — no full tensor in RAM.
+    Token IDs stay in RAM (small) for context string building.
     """
+    import gc
+
     device = device or get_device()
     sae = sae.to(device).eval()
-    
-    activations = activation_data.activations
-    token_ids = activation_data.token_ids
-    
+
     print("\nAnalyzing features...")
     print("  Method 1: MaxAct (input-centric) - what tokens activate each feature")
     print("  Method 2: VocabProj (output-centric) - what tokens each feature promotes")
-    
-    # Get decoder vectors (feature directions)
+
     decoder_weights = sae.decoder.weight.detach()  # [d_model, d_hidden]
-    
+
     # =========================================================================
-    # Pass 1: Compute basic statistics (batched for memory efficiency)
+    # Pass 1: Compute basic statistics — one chunk at a time
     # =========================================================================
     print("\n  Pass 1: Computing feature statistics...")
-    
+
     n_tokens = 0
     feature_sum = torch.zeros(sae.d_hidden)
     feature_count = torch.zeros(sae.d_hidden)
     feature_max = torch.full((sae.d_hidden,), float('-inf'))
-    
-    for i in tqdm(range(0, len(activations), BATCH_SIZE), desc="  Stats"):
-        batch = activations[i:i+BATCH_SIZE].to(device)
-        with torch.no_grad():
-            features = sae.encode(batch).cpu()
-        
-        feature_sum += features.sum(dim=0)
-        feature_count += (features > 0).float().sum(dim=0)
-        feature_max = torch.max(feature_max, features.max(dim=0).values)
-        n_tokens += features.shape[0]
-    
+
+    for chunk_path in tqdm(chunk_files, desc="  Stats (chunks)"):
+        chunk = torch.load(chunk_path)
+        for i in range(0, len(chunk), BATCH_SIZE):
+            batch = chunk[i:i+BATCH_SIZE].to(device)
+            with torch.no_grad():
+                features = sae.encode(batch).cpu()
+            feature_sum += features.sum(dim=0)
+            feature_count += (features > 0).float().sum(dim=0)
+            feature_max = torch.max(feature_max, features.max(dim=0).values)
+            n_tokens += features.shape[0]
+        del chunk
+        gc.collect()
+
     feature_freq = feature_count / n_tokens
     feature_mean = feature_sum / n_tokens
-    
+
     # =========================================================================
-    # Pass 2: MaxAct - Find top activating tokens for TOP features only
-    # (Computing for all 6144 features is expensive, so we focus on active ones)
+    # Pass 2: MaxAct — running top-k across all chunks
     # =========================================================================
     print("\n  Pass 2: Computing MaxAct for top features...")
-    
-    # Filter out BOS/EOS token to get semantic features (not positional)
+
     bos_token_id = model.tokenizer.bos_token_id or model.tokenizer.eos_token_id
     if bos_token_id is None:
-        bos_token_id = 50256  # GPT-2's <|endoftext|> token
+        bos_token_id = 50256
     print(f"    (Excluding BOS/EOS token {bos_token_id} from MaxAct)")
-    
-    # Create mask for content tokens (non-BOS positions)
+
     content_mask = token_ids != bos_token_id
-    
-    # Analyze ALL features (sorted by frequency for output ordering)
+
     num_features_to_analyze = sae.d_hidden
     top_feature_indices = feature_freq.topk(num_features_to_analyze).indices.tolist()
-    top_feature_set = set(top_feature_indices)
     print(f"    Analyzing all {num_features_to_analyze} features...")
-    
-    # Track top-k activations per feature — vectorized across ALL features at once
+
     topk_per_feature = top_k
     n_features = len(top_feature_indices)
     feat_idx_tensor = torch.tensor(top_feature_indices, dtype=torch.long)
 
-    # running_vals[k, f] = k-th largest activation seen so far for feature f
     running_vals = torch.full((topk_per_feature, n_features), float('-inf'))
     running_idxs = torch.zeros(topk_per_feature, n_features, dtype=torch.long)
 
-    for i in tqdm(range(0, len(activations), BATCH_SIZE), desc="  MaxAct"):
-        batch = activations[i:i+BATCH_SIZE].to(device)
-        batch_start_idx = i
-        batch_size_actual = batch.shape[0]
+    global_offset = 0  # track absolute token index across chunks
+    for chunk_path in tqdm(chunk_files, desc="  MaxAct (chunks)"):
+        chunk = torch.load(chunk_path)
 
-        # Get mask for this batch (exclude BOS tokens)
-        batch_mask = content_mask[batch_start_idx:batch_start_idx + batch_size_actual]  # [B]
+        for i in range(0, len(chunk), BATCH_SIZE):
+            batch = chunk[i:i+BATCH_SIZE].to(device)
+            batch_start_idx = global_offset + i
+            batch_size_actual = batch.shape[0]
 
-        with torch.no_grad():
-            features_all = sae.encode(batch).cpu()  # [B, d_hidden]
+            batch_mask = content_mask[batch_start_idx:batch_start_idx + batch_size_actual]
 
-        # Extract only the features we care about: [B, n_features]
-        batch_feats = features_all[:, feat_idx_tensor]
+            with torch.no_grad():
+                features_all = sae.encode(batch).cpu()
 
-        # Mask BOS positions
-        batch_feats[~batch_mask] = float('-inf')
+            batch_feats = features_all[:, feat_idx_tensor]
+            batch_feats[~batch_mask] = float('-inf')
 
-        # Global indices for this batch: [B]
-        global_idxs = torch.arange(batch_start_idx, batch_start_idx + batch_size_actual)
+            global_idxs = torch.arange(batch_start_idx, batch_start_idx + batch_size_actual)
 
-        # Combine with running top-k and keep top-k
-        # combined_vals: [topk + B, n_features], combined_idxs: [topk + B, n_features]
-        combined_vals = torch.cat([running_vals, batch_feats], dim=0)              # [topk+B, n_feat]
-        combined_idxs_global = torch.cat([
-            running_idxs,
-            global_idxs.unsqueeze(1).expand(-1, n_features)                        # [B, n_feat]
-        ], dim=0)
+            combined_vals = torch.cat([running_vals, batch_feats], dim=0)
+            combined_idxs_global = torch.cat([
+                running_idxs,
+                global_idxs.unsqueeze(1).expand(-1, n_features)
+            ], dim=0)
 
-        # topk over the combined dim=0
-        new_vals, new_positions = combined_vals.topk(topk_per_feature, dim=0)     # [topk, n_feat]
-        running_vals = new_vals
-        running_idxs = combined_idxs_global.gather(0, new_positions)
+            new_vals, new_positions = combined_vals.topk(topk_per_feature, dim=0)
+            running_vals = new_vals
+            running_idxs = combined_idxs_global.gather(0, new_positions)
 
-    # Convert back to per-feature dicts expected by downstream code
+        global_offset += len(chunk)
+        del chunk
+        gc.collect()
+
     max_act_values = {}
     max_act_indices = {}
     for f_pos, feat_idx in enumerate(top_feature_indices):
@@ -461,51 +449,55 @@ def analyze_features(
 
 def save_results(
     sae: SparseAutoencoder,
-    activation_data: ActivationData,
+    token_ids: torch.Tensor,
+    chunk_files: List[Path],
     features_info: List[FeatureInfo],
     history: Dict[str, List[float]],
     output_dir: Path = OUTPUT_DIR,
 ):
-    """Save all results to disk."""
+    """Save all results to disk. Processes chunks one at a time — no OOM."""
+    import gc
+
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    activations = activation_data.activations
-    token_ids = activation_data.token_ids
-    
     print(f"\nSaving results to {output_dir}...")
-    
-    # Save SAE
+
     sae.save(output_dir / "sae.pt")
-    
-    # Save activations and token IDs
-    torch.save(activations, output_dir / "activations.pt")
+
+    # Token IDs are small — save directly
     torch.save(token_ids, output_dir / "token_ids.pt")
-    print(f"  Saved activations: {activations.shape}")
     print(f"  Saved token_ids: {token_ids.shape}")
-    
-    # Save decoder vectors
+
+    # Chunk file manifest (so --skip-collection can find them)
+    chunk_manifest = [str(p) for p in chunk_files]
+    with open(output_dir / "activations.json", "w") as f:
+        json.dump(chunk_manifest, f)
+    print(f"  Saved chunk manifest: {len(chunk_files)} chunks")
+
     decoder_vectors = sae.decoder.weight.detach().cpu()
     torch.save(decoder_vectors, output_dir / "decoder_vectors.pt")
     print(f"  Saved decoder vectors: {decoder_vectors.shape}")
-    
-    # Compute summary stats in batches (avoid huge tensor in memory)
+
+    # Summary stats — one chunk at a time
     device = get_device()
     sae = sae.to(device).eval()
-    
+
     n_tokens = 0
     feature_count = torch.zeros(sae.d_hidden)
     total_l0 = 0.0
-    
-    print("  Computing summary statistics (batched)...")
-    for i in tqdm(range(0, len(activations), BATCH_SIZE), desc="  Stats"):
-        batch = activations[i:i+BATCH_SIZE].to(device)
-        with torch.no_grad():
-            features = sae.encode(batch).cpu()
-        
-        feature_count += (features > 0).float().sum(dim=0)
-        total_l0 += (features > 0).float().sum(dim=-1).sum().item()
-        n_tokens += features.shape[0]
-    
+
+    print("  Computing summary statistics (chunked)...")
+    for chunk_path in tqdm(chunk_files, desc="  Stats"):
+        chunk = torch.load(chunk_path)
+        for i in range(0, len(chunk), BATCH_SIZE):
+            batch = chunk[i:i+BATCH_SIZE].to(device)
+            with torch.no_grad():
+                features = sae.encode(batch).cpu()
+            feature_count += (features > 0).float().sum(dim=0)
+            total_l0 += (features > 0).float().sum(dim=-1).sum().item()
+            n_tokens += features.shape[0]
+        del chunk
+        gc.collect()
+
     feature_freq = feature_count / n_tokens
     dead_features = (feature_freq < 1e-5).sum().item()
     avg_l0 = total_l0 / n_tokens
@@ -551,7 +543,8 @@ def save_results(
         "hook_type": HOOK_TYPE,
         "d_model": D_MODEL,
         "d_hidden": sae.d_hidden,
-        "n_tokens": activations.shape[0],
+        "n_tokens": n_tokens,
+        "n_chunks": len(chunk_files),
         "dead_features": dead_features,
         "avg_l0_sparsity": avg_l0,
         "final_loss": history["loss"][-1] if history["loss"] else None,
@@ -559,13 +552,13 @@ def save_results(
     }
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
-    
+
     print(f"\n{'='*60}")
     print(f"  Results Summary")
     print(f"{'='*60}")
     print(f"  Model: {MODEL_NAME}")
     print(f"  Layer: {TARGET_LAYER} ({HOOK_TYPE})")
-    print(f"  Tokens: {activations.shape[0]:,}")
+    print(f"  Tokens: {n_tokens:,} ({len(chunk_files)} chunks on disk)")
     print(f"  Features: {sae.d_hidden:,}")
     print(f"  Dead features: {dead_features}")
     print(f"  Avg L0 sparsity: {avg_l0:.1f}")
@@ -579,60 +572,57 @@ def save_results(
 def main():
     parser = argparse.ArgumentParser(description="SAE Feature Extraction for GPT-2")
     parser.add_argument("--quick", action="store_true", help="Quick test mode")
-    parser.add_argument("--skip-collection", action="store_true", help="Use cached activations")
+    parser.add_argument("--skip-collection", action="store_true", help="Use cached chunks")
     parser.add_argument("--device", type=str, default=None, help="Device (auto-detected)")
     args = parser.parse_args()
-    
+
     device = args.device or get_device()
-    
-    # Quick test settings
+
     num_samples = 500 if args.quick else NUM_SAMPLES
     num_epochs = 1 if args.quick else NUM_EPOCHS
-    
+
     print("\n" + "="*60)
     print("  SAE Feature Extraction Pipeline")
     print(f"  Model: {MODEL_NAME} | Layer: {TARGET_LAYER} | Hook: {HOOK_TYPE}")
     print("="*60)
-    
+
     if args.quick:
         print("  [QUICK TEST MODE]")
-    
+
     # Step 1: Load model
     model = load_gpt2(device)
-    
-    # Step 2: Collect or load activations (with token IDs for MaxAct analysis)
-    activations_path = OUTPUT_DIR / "activations.pt"
+
+    # Step 2: Collect activations as on-disk chunks (never load all into RAM)
+    manifest_path = OUTPUT_DIR / "activations.json"
     token_ids_path = OUTPUT_DIR / "token_ids.pt"
-    
-    if args.skip_collection and activations_path.exists() and token_ids_path.exists():
-        print(f"\nLoading cached activations from {OUTPUT_DIR}...")
-        activations = torch.load(activations_path)
+
+    if args.skip_collection and manifest_path.exists() and token_ids_path.exists():
+        print(f"\nLoading cached chunks from {OUTPUT_DIR}...")
+        with open(manifest_path) as f:
+            chunk_files = [Path(p) for p in json.load(f)]
         token_ids = torch.load(token_ids_path)
-        activation_data = ActivationData(activations=activations, token_ids=token_ids)
-        print(f"  Loaded {activations.shape[0]:,} activations with token IDs")
-    elif args.skip_collection and activations_path.exists():
-        print(f"\nWARNING: Found activations but no token_ids. Re-collecting for MaxAct analysis...")
-        activation_data = collect_activations(model, num_samples=num_samples)
+        print(f"  Found {len(chunk_files)} chunk files, {token_ids.shape[0]:,} token IDs")
     else:
-        activation_data = collect_activations(model, num_samples=num_samples)
-    
-    # Free model memory for training
+        token_ids, chunk_files = collect_activations(model, num_samples=num_samples)
+
+    # Free GPT-2 memory before training
     del model
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    
-    # Step 3: Train SAE (uses only activations tensor)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Step 3: Train SAE — loads one chunk at a time
     sae = SparseAutoencoder()
-    history = train_sae(sae, activation_data.activations, num_epochs=num_epochs, device=device)
-    
-    # Step 4: Analyze features (uses both activations and token_ids)
-    model = load_gpt2(device)  # Reload for analysis
+    history = train_sae(sae, chunk_files, num_epochs=num_epochs, device=device)
+
+    # Step 4: Analyze features — loads one chunk at a time
+    model = load_gpt2(device)
     print("\n  Feature analysis using dual methods:")
     print("    - MaxAct: Find tokens that maximally activate each feature")
     print("    - VocabProj: Find tokens each feature promotes in output")
-    features_info = analyze_features(sae, model, activation_data, device=device)
-    
+    features_info = analyze_features(sae, model, token_ids, chunk_files, device=device)
+
     # Step 5: Save results
-    save_results(sae, activation_data, features_info, history)
+    save_results(sae, token_ids, chunk_files, features_info, history)
 
 
 if __name__ == "__main__":
