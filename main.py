@@ -53,16 +53,23 @@ def collect_activations(
     num_samples: int = NUM_SAMPLES,
     batch_size: int = 32,
     max_tokens: int = 128,
+    chunk_size: int = 25_000,  # Save to disk every 25k samples to avoid OOM
 ) -> ActivationData:
     """
     Collect residual stream activations from GPT-2 layer 6.
     
     Uses OpenWebText dataset for diverse text inputs.
     Returns both activations and corresponding token IDs for MaxAct analysis.
+    
+    For large datasets (>50k), saves intermediate chunks to disk to avoid OOM.
     """
+    import gc
+    
     hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
     print(f"\nCollecting activations from {hook_point}...")
     print(f"  Samples: {num_samples}, Batch size: {batch_size}")
+    if num_samples > chunk_size:
+        print(f"  Chunked mode: saving every {chunk_size} samples to avoid OOM")
     
     # Load dataset
     dataset = load_dataset("openwebtext", split="train", streaming=True)
@@ -71,6 +78,8 @@ def collect_activations(
     all_token_ids = []
     batch = []
     count = 0
+    chunk_idx = 0
+    chunk_files = []
     
     pbar = tqdm(total=num_samples, desc="Collecting")
     
@@ -97,8 +106,25 @@ def collect_activations(
             all_token_ids.append(tokens.reshape(-1).cpu())
             
             del cache
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             batch = []
+        
+        # Save chunk to disk if we've collected enough (prevents OOM)
+        if count % chunk_size == 0 and count > 0 and all_activations:
+            chunk_acts = torch.cat(all_activations, dim=0)
+            chunk_ids = torch.cat(all_token_ids, dim=0)
+            chunk_path = OUTPUT_DIR / f"chunk_{chunk_idx}.pt"
+            torch.save({"activations": chunk_acts, "token_ids": chunk_ids}, chunk_path)
+            chunk_files.append(chunk_path)
+            print(f"\n  Saved chunk {chunk_idx} ({chunk_acts.shape[0]} tokens) to {chunk_path}")
+            
+            # Clear memory
+            del all_activations, all_token_ids, chunk_acts, chunk_ids
+            all_activations = []
+            all_token_ids = []
+            gc.collect()
+            chunk_idx += 1
         
         if count >= num_samples:
             break
@@ -115,8 +141,35 @@ def collect_activations(
     
     pbar.close()
     
-    activations = torch.cat(all_activations, dim=0)
-    token_ids = torch.cat(all_token_ids, dim=0)
+    # If we saved chunks, merge them
+    if chunk_files:
+        # Save final partial chunk if any
+        if all_activations:
+            chunk_acts = torch.cat(all_activations, dim=0)
+            chunk_ids = torch.cat(all_token_ids, dim=0)
+            chunk_path = OUTPUT_DIR / f"chunk_{chunk_idx}.pt"
+            torch.save({"activations": chunk_acts, "token_ids": chunk_ids}, chunk_path)
+            chunk_files.append(chunk_path)
+            del all_activations, all_token_ids
+            gc.collect()
+        
+        # Merge all chunks
+        print(f"\n  Merging {len(chunk_files)} chunks...")
+        all_acts = []
+        all_ids = []
+        for chunk_path in chunk_files:
+            data = torch.load(chunk_path)
+            all_acts.append(data["activations"])
+            all_ids.append(data["token_ids"])
+            chunk_path.unlink()  # Delete chunk file after loading
+        
+        activations = torch.cat(all_acts, dim=0)
+        token_ids = torch.cat(all_ids, dim=0)
+        del all_acts, all_ids
+        gc.collect()
+    else:
+        activations = torch.cat(all_activations, dim=0)
+        token_ids = torch.cat(all_token_ids, dim=0)
     
     print(f"  Collected {activations.shape[0]:,} token activations")
     return ActivationData(activations=activations, token_ids=token_ids)
