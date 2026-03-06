@@ -53,7 +53,7 @@ def collect_activations(
     num_samples: int = NUM_SAMPLES,
     batch_size: int = 32,
     max_tokens: int = 128,
-    chunk_size: int = 5_000,  # ~2.6 GB per chunk at 128 tokens × 1024 dims
+    chunk_size: int = 10_000,  # ~5.2 GB per chunk at 128 tokens × 1024 dims
 ) -> tuple:
     """
     Collect residual stream activations from GPT-2 layer 12.

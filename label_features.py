@@ -8,7 +8,7 @@ Usage:
     python label_features.py              # Label features (quality-filtered)
     python label_features.py --dry-run    # Preview without API calls
     python label_features.py --no-filter  # Skip quality filter, label all
-    python label_features.py --min-freq 0.002 --max-freq 0.10  # Custom thresholds
+    python label_features.py --min-freq 0.001 --max-freq 0.10  # Custom thresholds
 """
 
 import json
@@ -130,9 +130,9 @@ def compute_quality_score(feature: Dict[str, Any]) -> float:
 
 def filter_high_quality_features(
     features: List[Dict[str, Any]],
-    min_freq: float = 0.002,   # 0.2%  — exclude near-dead features
+    min_freq: float = 0.001,   # 0.1%  — exclude near-dead features
     max_freq: float = 0.15,    # 15%   — exclude always-on polysemantic features
-    min_max_act: int = 3,      # need ≥3 MaxAct examples to assess coherence
+    min_max_act: int = 2,      # need ≥2 MaxAct examples to assess coherence
     min_vocab_proj: int = 3,   # need ≥3 VocabProj tokens to assess output signal
 ) -> List[Dict[str, Any]]:
     """
@@ -297,7 +297,7 @@ def label_features(
     features: List[Dict],
     model: str = "gpt-4o-mini",
     dry_run: bool = False,
-    max_features: int = 2000,
+    max_features: int = 3500,
     batch_size: int = BATCH_SIZE,
     min_freq: float = 0.001,
     max_freq: float = 0.15,
@@ -447,14 +447,14 @@ def main():
                         help="OpenAI model to use (default: gpt-4o-mini)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview features without API calls")
-    parser.add_argument("--max-features", type=int, default=2000,
-                        help="Maximum features to label (default: 2000)")
+    parser.add_argument("--max-features", type=int, default=3500,
+                        help="Maximum features to label (default: 3500)")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
                         help=f"Features per API call (default: {BATCH_SIZE})")
     parser.add_argument("--output", type=str, default=None,
                         help="Output file path")
-    parser.add_argument("--min-freq", type=float, default=0.002,
-                        help="Min activation frequency to include (default: 0.001 = 0.2%%)")
+    parser.add_argument("--min-freq", type=float, default=0.001,
+                        help="Min activation frequency to include (default: 0.001 = 0.1%%)")
     parser.add_argument("--max-freq", type=float, default=0.15,
                         help="Max activation frequency to include (default: 0.15 = 15%%)")
     parser.add_argument("--no-filter", action="store_true",
