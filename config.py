@@ -92,21 +92,29 @@ class MaxActExample:
 class FeatureInfo:
     """
     Information about a learned feature using both interpretability methods.
-    
+
     Input-centric (MaxAct): What inputs trigger this feature?
     Output-centric (VocabProj): What outputs does this feature promote?
+    Positional: Does this feature fire at specific positions in the sequence?
     """
     index: int
     activation_frequency: float
     mean_activation: float
     max_activation: float
-    
+
     # Input-centric: tokens that maximally ACTIVATE this feature (what triggers it)
     max_activating_tokens: List[MaxActExample]
-    
+
     # Output-centric: tokens this feature PROMOTES in output (what it does)
     vocab_projection: List[str]
     vocab_projection_logits: List[float]
+
+    # Positional: average and std of token position-in-sequence for top activations.
+    # position_mean near 0   → fires at context start
+    # position_mean near 127 → fires at context end
+    # position_std low       → positional feature; position_std high → context-independent
+    position_mean: float = 0.0
+    position_std: float = 0.0
 
 
 # =============================================================================
