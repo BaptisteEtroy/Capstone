@@ -24,7 +24,7 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 load_dotenv()
 
-from config import OUTPUT_DIR, FEATURES_PATH
+from config import MEDICAL_OUTPUT_DIR, MEDICAL_FEATURES_PATH
 
 
 @dataclass
@@ -56,7 +56,7 @@ def call_openai(prompt: str, model: str = "gpt-4o-mini") -> str:
                     "role": "system",
                     "content": (
                         "You are an expert in mechanistic interpretability of neural networks. "
-                        "Your task is to label features extracted from a Sparse Autoencoder (SAE) trained on GPT-2 Medium. "
+                        "Your task is to label features extracted from a Sparse Autoencoder (SAE) trained on Llama 3.2 1B processing medical text. "
                         "MaxAct tokens are real input tokens that triggered the feature (what it detects). "
                         "VocabProj tokens are output tokens the feature promotes (what it causes). "
                         "Give specific, concrete labels — avoid vague terms like 'language patterns', 'text features', 'linguistic', or 'general concepts'."
@@ -230,7 +230,7 @@ VocabProj (promotes, logit boost): {', '.join(vocab_parts) if vocab_parts else '
 ---
 """
 
-    prompt = f"""Analyze these neural network features from a Sparse Autoencoder trained on GPT-2 Medium.
+    prompt = f"""Analyze these neural network features from a Sparse Autoencoder trained on Llama 3.2 1B processing medical text.
 
 For each feature:
 - MaxAct = tokens (with activation strength) that TRIGGER the feature (input-centric)
@@ -461,15 +461,15 @@ def main():
                         help="Disable quality filter, label all features")
     args = parser.parse_args()
 
-    # Load features
-    if not FEATURES_PATH.exists():
-        print(f"Error: {FEATURES_PATH} not found. Run main.py first.")
+    # Load features from medical_outputs
+    if not MEDICAL_FEATURES_PATH.exists():
+        print(f"Error: {MEDICAL_FEATURES_PATH} not found. Run main.py first.")
         return
 
-    with open(FEATURES_PATH) as f:
+    with open(MEDICAL_FEATURES_PATH) as f:
         features = json.load(f)
 
-    print(f"Loaded {len(features)} features from {FEATURES_PATH}")
+    print(f"Loaded {len(features)} features from {MEDICAL_FEATURES_PATH}")
 
     # Check API key
     if not args.dry_run:
@@ -496,7 +496,7 @@ def main():
     print_labeled_features(labeled_features)
 
     # Save results
-    output_path = Path(args.output) if args.output else OUTPUT_DIR / "labeled_features.json"
+    output_path = Path(args.output) if args.output else MEDICAL_OUTPUT_DIR / "labeled_features.json"
     save_labeled_features(labeled_features, output_path)
 
 

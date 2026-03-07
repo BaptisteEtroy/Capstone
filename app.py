@@ -17,12 +17,11 @@ from typing import Dict, List, Tuple
 import plotly.graph_objects as go
 from transformer_lens import HookedTransformer
 
-from transformers import AutoModelForCausalLM
 
 from config import (
     SparseAutoencoder,
     MODEL_NAME, TARGET_LAYER, HOOK_TYPE,
-    OUTPUT_DIR, SAE_PATH, FINETUNE_OUTPUT_DIR, MEDICAL_OUTPUT_DIR,
+    OUTPUT_DIR, SAE_PATH, MEDICAL_OUTPUT_DIR,
     get_device,
 )
 
@@ -610,22 +609,13 @@ class MedicalState:
             return
 
         med_sae_path = MEDICAL_OUTPUT_DIR / "sae.pt"
-        if not FINETUNE_OUTPUT_DIR.exists() or not med_sae_path.exists():
-            self.error = (
-                f"Medical model not found. Run:\n"
-                f"  1. `python finetune.py` → saves to {FINETUNE_OUTPUT_DIR}\n"
-                f"  2. `python main.py --model-path {FINETUNE_OUTPUT_DIR} "
-                f"--dataset medical --output-dir {MEDICAL_OUTPUT_DIR}`"
-            )
+        if not med_sae_path.exists():
+            self.error = f"Medical SAE not found. Run: python main.py"
             return
 
         print("Loading medical model...")
         try:
-            hf_model = AutoModelForCausalLM.from_pretrained(
-                str(FINETUNE_OUTPUT_DIR), torch_dtype=torch.float32
-            )
-            self.model = HookedTransformer.from_pretrained(MODEL_NAME, hf_model=hf_model)
-            self.model.to(self.device)
+            self.model = HookedTransformer.from_pretrained(MODEL_NAME, device=self.device)
             self.model.eval()
 
             self.sae = SparseAutoencoder.load(med_sae_path)

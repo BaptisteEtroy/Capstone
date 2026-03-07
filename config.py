@@ -41,8 +41,11 @@ NUM_SAMPLES = 10_000
 OUTPUT_DIR = Path("outputs")
 SAE_PATH = OUTPUT_DIR / "sae.pt"
 FEATURES_PATH = OUTPUT_DIR / "features.json"
-FINETUNE_OUTPUT_DIR = OUTPUT_DIR / "llama-medical"  # fine-tuned model weights
-MEDICAL_OUTPUT_DIR = OUTPUT_DIR / "medical"         # medical SAE outputs
+
+# Medical outputs (separate directory in project root)
+MEDICAL_OUTPUT_DIR = Path("medical_outputs")
+MEDICAL_SAE_PATH = MEDICAL_OUTPUT_DIR / "sae.pt"
+MEDICAL_FEATURES_PATH = MEDICAL_OUTPUT_DIR / "features.json"
 
 
 # =============================================================================
@@ -71,13 +74,6 @@ class SAEOutput:
     reconstruction_loss: torch.Tensor
     sparsity_loss: torch.Tensor
     l0_sparsity: torch.Tensor
-
-
-@dataclass
-class ActivationData:
-    """Container for activations and their corresponding token IDs."""
-    activations: torch.Tensor  # [n_tokens, d_model]
-    token_ids: torch.Tensor    # [n_tokens] - the actual input tokens
 
 
 @dataclass
