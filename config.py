@@ -41,6 +41,8 @@ NUM_SAMPLES = 10_000
 OUTPUT_DIR = Path("outputs")
 SAE_PATH = OUTPUT_DIR / "sae.pt"
 FEATURES_PATH = OUTPUT_DIR / "features.json"
+FINETUNE_OUTPUT_DIR = OUTPUT_DIR / "llama-medical"  # fine-tuned model weights
+MEDICAL_OUTPUT_DIR = OUTPUT_DIR / "medical"         # medical SAE outputs
 
 
 # =============================================================================
@@ -84,8 +86,9 @@ class MaxActExample:
     token: str
     token_id: int
     activation: float
-    context: str = ""           # ±5 token window with [TOKEN] marker
+    context: str = ""           # ±50 token window with [TOKEN] marker
     global_token_idx: int = -1  # position in flat token_ids tensor
+    source_id: str = ""         # which training document this came from
 
 
 @dataclass
