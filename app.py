@@ -71,8 +71,8 @@ class AppState:
             return
         
         print("Loading models...")
-        
-        # Load GPT-2
+
+        # Load model (Llama 3.2 1B requires HF token: huggingface-cli login)
         self.model = HookedTransformer.from_pretrained(MODEL_NAME)
         self.model.to(self.device)
         self.model.eval()
@@ -769,7 +769,7 @@ def build_ui():
                     with gr.Column(scale=1):
                         feature_index_input = gr.Number(
                             value=0,
-                            label="Feature Index (0-8191)",
+                            label=f"Feature Index (0-{8192-1})",
                             precision=0,
                         )
                         analyze_feature_btn = gr.Button("🔍 Analyze Feature", variant="primary")

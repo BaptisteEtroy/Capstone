@@ -34,14 +34,16 @@ from config import (
 # =============================================================================
 
 
-def load_gpt2(device: Optional[str] = None) -> HookedTransformer:
+def load_model(device: Optional[str] = None) -> HookedTransformer:
     device = device or get_device()
-    print(f"\nLoading GPT-2 on {device}...")
-    
+    print(f"\nLoading {MODEL_NAME} on {device}...")
+
     model = HookedTransformer.from_pretrained(
         MODEL_NAME,
         device=device,
         dtype=torch.float32,
+        # Llama 3.2 requires HuggingFace token (set HF_TOKEN env var or huggingface-cli login)
+        # For bfloat16 on MPS/CUDA: change dtype=torch.bfloat16 to halve memory usage
     )
     print(f"  d_model: {model.cfg.d_model}, n_layers: {model.cfg.n_layers}")
     return model
@@ -56,7 +58,7 @@ def collect_activations(
     chunk_size: int = 10_000,  # ~5.2 GB per chunk at 128 tokens × 1024 dims
 ) -> tuple:
     """
-    Collect residual stream activations from GPT-2 layer 12.
+    Collect residual stream activations from Llama layer {TARGET_LAYER}.
 
     Saves activation chunks to disk to stay within RAM limits.
     Token IDs (~100 MB total) are kept in memory for MaxAct context building.
@@ -570,7 +572,7 @@ def save_results(
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="SAE Feature Extraction for GPT-2")
+    parser = argparse.ArgumentParser(description="SAE Feature Extraction for Llama 3.2 1B")
     parser.add_argument("--quick", action="store_true", help="Quick test mode")
     parser.add_argument("--skip-collection", action="store_true", help="Use cached chunks")
     parser.add_argument("--device", type=str, default=None, help="Device (auto-detected)")
@@ -590,7 +592,7 @@ def main():
         print("  [QUICK TEST MODE]")
 
     # Step 1: Load model
-    model = load_gpt2(device)
+    model = load_model(device)
 
     # Step 2: Collect activations as on-disk chunks (never load all into RAM)
     manifest_path = OUTPUT_DIR / "activations.json"
@@ -605,7 +607,7 @@ def main():
     else:
         token_ids, chunk_files = collect_activations(model, num_samples=num_samples)
 
-    # Free GPT-2 memory before training
+    # Free model memory before training
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -615,7 +617,7 @@ def main():
     history = train_sae(sae, chunk_files, num_epochs=num_epochs, device=device)
 
     # Step 4: Analyze features — loads one chunk at a time
-    model = load_gpt2(device)
+    model = load_model(device)
     print("\n  Feature analysis using dual methods:")
     print("    - MaxAct: Find tokens that maximally activate each feature")
     print("    - VocabProj: Find tokens each feature promotes in output")

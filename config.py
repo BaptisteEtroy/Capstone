@@ -16,18 +16,18 @@ from typing import List
 # Configuration Constants
 # =============================================================================
 
-# Model: GPT-2 Medium (355M params, richer representations)
-MODEL_NAME = "gpt2-medium"
-D_MODEL = 1024
-N_LAYERS = 24
+# Model: Llama 3.2 1B (instruction-tuned available at meta-llama/Llama-3.2-1B-Instruct)
+MODEL_NAME = "meta-llama/Llama-3.2-1B"
+D_MODEL = 2048
+N_LAYERS = 16
 
 # Layer: Middle layer for semantic features (lit review: features are most interpretable here)
-TARGET_LAYER = 12  # Middle of 24 layers
+TARGET_LAYER = 8  # Middle of 16 layers
 HOOK_TYPE = "resid_post"
 
 # SAE: TopK architecture (Gao et al. 2024) — activates exactly K features per token.
 # Eliminates L1 tuning, ghost gradients, and dead neurons by construction.
-EXPANSION_FACTOR = 8  # Hidden dim = 1024 * 8 = 8192 features
+EXPANSION_FACTOR = 4  # Hidden dim = 2048 * 4 = 8192 features (same count as before)
 TOP_K = 100           # Exactly 100 features active per token (L0 = K, always)
 AUX_COEFF = 1 / 32   # Auxiliary loss weight (Gao et al. 2024): gives dead features gradient signal
 
@@ -35,7 +35,7 @@ AUX_COEFF = 1 / 32   # Auxiliary loss weight (Gao et al. 2024): gives dead featu
 LEARNING_RATE = 1e-4
 NUM_EPOCHS = 5
 BATCH_SIZE = 4096
-NUM_SAMPLES = 500_000
+NUM_SAMPLES = 10_000
 
 # Output
 OUTPUT_DIR = Path("outputs")
