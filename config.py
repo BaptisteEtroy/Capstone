@@ -17,7 +17,7 @@ from typing import List
 # =============================================================================
 
 # Model: Llama 3.2 1B (instruction-tuned available at meta-llama/Llama-3.2-1B-Instruct)
-MODEL_NAME = "meta-llama/Llama-3.2-1B"
+MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 D_MODEL = 2048
 N_LAYERS = 16
 
@@ -28,8 +28,8 @@ HOOK_TYPE = "resid_post"
 # SAE: TopK architecture (Gao et al. 2024) — activates exactly K features per token.
 # Eliminates L1 tuning, ghost gradients, and dead neurons by construction.
 EXPANSION_FACTOR = 4  # Hidden dim = 2048 * 4 = 8192 features (same count as before)
-TOP_K = 100           # Exactly 100 features active per token (L0 = K, always)
-AUX_COEFF = 1 / 32   # Auxiliary loss weight (Gao et al. 2024): gives dead features gradient signal
+TOP_K = 32            # Exactly 32 features active per token — sparser, more monosemantic
+AUX_COEFF = 1 / 8    # Higher aux weight for structured medical text (more dead feature signal)
 
 # Training
 LEARNING_RATE = 1e-4

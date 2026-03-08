@@ -48,52 +48,34 @@ def load_model(device: Optional[str] = None) -> HookedTransformer:
 # Medical Dataset Helpers
 # =============================================================================
 
-def _format_medmcqa(item) -> str:
-    q = item.get("question", "")
-    opts = [item.get("opa", ""), item.get("opb", ""), item.get("opc", ""), item.get("opd", "")]
-    cop = item.get("cop", 0)
-    answer = opts[cop] if isinstance(cop, int) and cop < len(opts) else ""
-    exp = item.get("exp", "") or ""
-    text = f"Question: {q}\nA) {opts[0]} B) {opts[1]} C) {opts[2]} D) {opts[3]}\nAnswer: {answer}"
-    if exp:
-        text += f"\nExplanation: {exp}"
-    return text
-
-
-def _format_pubmed_qa(item) -> str:
-    q = item.get("question", "")
-    ctx_list = item.get("context", {}).get("contexts", []) if isinstance(item.get("context"), dict) else []
-    ctx = " ".join(ctx_list)[:600]
-    answer = item.get("long_answer", "") or item.get("final_decision", "")
-    return f"Question: {q}\nContext: {ctx}\nAnswer: {answer}"
-
-
 def _stream_texts(num_samples: int, max_tokens: int):
-    """Yield (text, source_id) tuples from medical datasets (medmcqa + pubmed_qa)."""
+    """Yield (text, source_id) tuples from raw PubMed abstracts + PubMed QA contexts."""
     count = 0
     half = num_samples // 2
 
-    # medmcqa (~194k samples)
+    # ccdv/pubmed-summarization — raw PubMed abstracts (~119k train samples)
+    # Plain prose medical language, no MCQ formatting artifacts
     try:
-        ds = load_dataset("medmcqa", split="train", streaming=True)
+        ds = load_dataset("ccdv/pubmed-summarization", "document", split="train", streaming=True)
         for item in ds:
-            text = _format_medmcqa(item)
+            text = (item.get("abstract") or item.get("article", ""))[:max_tokens * 4]
             if text.strip():
-                yield text[:max_tokens * 4], f"medmcqa:{count}"
+                yield text, f"pubmed_abs:{count}"
                 count += 1
                 if count >= half:
                     break
     except Exception as e:
-        print(f"  MedMCQA stream error: {e}")
+        print(f"  PubMed abstracts stream error: {e}")
 
-    # pubmed_qa pqa_artificial (~211k samples)
+    # pubmed_qa pqa_artificial — keep context passages (drop Q/A formatting)
     try:
         ds = load_dataset("pubmed_qa", "pqa_artificial", split="train",
                           streaming=True, trust_remote_code=True)
         for item in ds:
-            text = _format_pubmed_qa(item)
+            ctx_list = item.get("context", {}).get("contexts", []) if isinstance(item.get("context"), dict) else []
+            text = " ".join(ctx_list)[:max_tokens * 4]
             if text.strip():
-                yield text[:max_tokens * 4], f"pubmed_qa:{count}"
+                yield text, f"pubmed_qa:{count}"
                 count += 1
                 if count >= num_samples:
                     return
@@ -271,6 +253,9 @@ def train_sae(
     history = {"loss": [], "reconstruction": []}
     global_step = 0
 
+    # Track per-feature activation counts for dead feature resampling
+    feature_counts = torch.zeros(sae.d_hidden, device=device)
+
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         epoch_steps = 0
@@ -280,7 +265,7 @@ def train_sae(
         random.shuffle(shuffled_chunks)
 
         for chunk_path in shuffled_chunks:
-            activations = torch.load(chunk_path).float()  # Convert float16 back to float32 for training
+            activations = torch.load(chunk_path).float()
             dataset = torch.utils.data.TensorDataset(activations)
             loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
@@ -296,6 +281,10 @@ def train_sae(
                 scheduler.step()
                 sae._normalize_decoder()
 
+                # Track which features fired
+                with torch.no_grad():
+                    feature_counts += (output.hidden > 0).float().sum(dim=0)
+
                 epoch_loss += output.loss.item()
                 epoch_steps += 1
                 global_step += 1
@@ -310,6 +299,27 @@ def train_sae(
             gc.collect()
 
         print(f"  Epoch {epoch+1} avg loss: {epoch_loss / epoch_steps:.4f}")
+
+        # Dead feature resampling: reinitialize features that never fired this epoch
+        # by copying a random live feature's direction with small noise
+        with torch.no_grad():
+            dead_mask = feature_counts < 1.0
+            n_dead = dead_mask.sum().item()
+            if n_dead > 0:
+                alive_indices = (~dead_mask).nonzero(as_tuple=True)[0]
+                if len(alive_indices) > 0:
+                    sample_indices = alive_indices[torch.randint(len(alive_indices), (n_dead,), device=device)]
+                    dead_indices = dead_mask.nonzero(as_tuple=True)[0]
+                    noise_scale = sae.encoder.weight.data[sample_indices].norm(dim=1, keepdim=True) * 0.1
+                    sae.encoder.weight.data[dead_indices] = (
+                        sae.encoder.weight.data[sample_indices]
+                        + torch.randn_like(sae.encoder.weight.data[sample_indices]) * noise_scale
+                    )
+                    sae.encoder.bias.data[dead_indices] = sae.encoder.bias.data[sample_indices]
+                    sae.decoder.weight.data[:, dead_indices] = sae.decoder.weight.data[:, sample_indices]
+                    sae._normalize_decoder()
+                    print(f"  Resampled {n_dead} dead features")
+        feature_counts.zero_()  # reset counts for next epoch
 
     print(f"\nTraining complete!")
     return history
