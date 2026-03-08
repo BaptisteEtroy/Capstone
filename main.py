@@ -176,7 +176,7 @@ def collect_activations(
 
         # Flush chunk to disk
         if count % chunk_size == 0 and count > 0 and all_activations:
-            chunk_acts = torch.cat(all_activations, dim=0)
+            chunk_acts = torch.cat(all_activations, dim=0).half()  # float16 to save disk space
             chunk_path = chunks_dir / f"chunk_{chunk_idx}.pt"
             torch.save(chunk_acts, chunk_path)
             chunk_files.append(chunk_path)
@@ -210,7 +210,7 @@ def collect_activations(
 
     # Save final chunk
     if all_activations:
-        chunk_acts = torch.cat(all_activations, dim=0)
+        chunk_acts = torch.cat(all_activations, dim=0).half()  # float16 to save disk space
         chunk_path = chunks_dir / f"chunk_{chunk_idx}.pt"
         torch.save(chunk_acts, chunk_path)
         chunk_files.append(chunk_path)
@@ -254,7 +254,7 @@ def train_sae(
     sae = sae.to(device)
 
     # Estimate total steps for scheduler (use first chunk size as proxy)
-    first_chunk = torch.load(chunk_files[0])
+    first_chunk = torch.load(chunk_files[0])  # No .float() needed, just checking shape
     steps_per_chunk = (first_chunk.shape[0] + batch_size - 1) // batch_size
     del first_chunk
     total_steps = steps_per_chunk * len(chunk_files) * num_epochs
@@ -280,7 +280,7 @@ def train_sae(
         random.shuffle(shuffled_chunks)
 
         for chunk_path in shuffled_chunks:
-            activations = torch.load(chunk_path)
+            activations = torch.load(chunk_path).float()  # Convert float16 back to float32 for training
             dataset = torch.utils.data.TensorDataset(activations)
             loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
@@ -374,7 +374,7 @@ def analyze_features(
     feature_max = torch.full((sae.d_hidden,), float('-inf'))
 
     for chunk_path in tqdm(chunk_files, desc="  Stats (chunks)"):
-        chunk = torch.load(chunk_path)
+        chunk = torch.load(chunk_path).float()  # Convert float16 back to float32
         for i in range(0, len(chunk), BATCH_SIZE):
             batch = chunk[i:i+BATCH_SIZE].to(device)
             with torch.no_grad():
@@ -414,7 +414,7 @@ def analyze_features(
 
     global_offset = 0  # track absolute token index across chunks
     for chunk_path in tqdm(chunk_files, desc="  MaxAct (chunks)"):
-        chunk = torch.load(chunk_path)
+        chunk = torch.load(chunk_path).float()  # Convert float16 back to float32
 
         for i in range(0, len(chunk), BATCH_SIZE):
             batch = chunk[i:i+BATCH_SIZE].to(device)
@@ -573,7 +573,7 @@ def save_results(
 
     print("  Computing summary statistics (chunked)...")
     for chunk_path in tqdm(chunk_files, desc="  Stats"):
-        chunk = torch.load(chunk_path)
+        chunk = torch.load(chunk_path).float()  # Convert float16 back to float32
         for i in range(0, len(chunk), BATCH_SIZE):
             batch = chunk[i:i+BATCH_SIZE].to(device)
             with torch.no_grad():

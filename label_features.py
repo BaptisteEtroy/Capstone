@@ -351,7 +351,10 @@ def label_features(
             # Process results
             labeled_ids = set()
             for feature_id, label, confidence, reasoning in results:
-                if label.upper() != "UNLABELED":
+                if feature_id in labeled_ids:
+                    continue  # skip duplicates from same batch
+                labeled_ids.add(feature_id)
+                if "UNLABELED" not in label.upper():
                     max_act, vocab_proj = extract_feature_tokens(feature_lookup[feature_id])
                     labeled_features.append(LabeledFeature(
                         index=feature_id,
@@ -362,10 +365,8 @@ def label_features(
                         reasoning=reasoning,
                         quality_score=quality_scores[feature_id],
                     ))
-                    labeled_ids.add(feature_id)
                 else:
                     unlabeled_count += 1
-                    labeled_ids.add(feature_id)
 
             # Count features not in response as unlabeled
             unlabeled_count += len(batch) - len(labeled_ids)
