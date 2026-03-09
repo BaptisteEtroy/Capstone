@@ -17,12 +17,16 @@ from typing import Dict, List, Tuple
 import plotly.graph_objects as go
 from transformer_lens import HookedTransformer
 
+
 from config import (
     SparseAutoencoder,
     MODEL_NAME, TARGET_LAYER, HOOK_TYPE,
-    OUTPUT_DIR, SAE_PATH,
+    OUTPUT_DIR, SAE_PATH, MEDICAL_OUTPUT_DIR,
     get_device,
 )
+
+# Special tokens to exclude from circuit analysis (Llama 3.2 + GPT-2 compatible)
+_SPECIAL_TOKENS = {"<|endoftext|>", "<|begin_of_text|>", "<|end_of_text|>", "<|eot_id|>", ""}
 
 
 # =============================================================================
@@ -32,7 +36,7 @@ from config import (
 def get_feature_choices() -> List[str]:
     """Get list of labeled features for dropdown, sorted by confidence."""
     try:
-        with open(OUTPUT_DIR / "labeled_features.json") as f:
+        with open(MEDICAL_OUTPUT_DIR / "labeled_features.json") as f:
             features = json.load(f)
         
         # Sort by confidence (high first)
@@ -71,23 +75,23 @@ class AppState:
             return
         
         print("Loading models...")
-        
-        # Load GPT-2
+
+        # Load model (Llama 3.2 1B requires HF token: huggingface-cli login)
         self.model = HookedTransformer.from_pretrained(MODEL_NAME)
         self.model.to(self.device)
         self.model.eval()
         
-        # Load SAE
-        self.sae = SparseAutoencoder.load(SAE_PATH)
+        # Load SAE from medical outputs
+        self.sae = SparseAutoencoder.load(MEDICAL_OUTPUT_DIR / "sae.pt")
         self.sae.to(self.device)
         self.sae.eval()
         
-        # Load labeled features
-        with open(OUTPUT_DIR / "labeled_features.json") as f:
+        # Load labeled features from medical outputs
+        with open(MEDICAL_OUTPUT_DIR / "labeled_features.json") as f:
             self.labeled_features = json.load(f)
         
         # Load ALL features (for circuit analysis)
-        features_path = OUTPUT_DIR / "features.json"
+        features_path = MEDICAL_OUTPUT_DIR / "features.json"
         if features_path.exists():
             with open(features_path) as f:
                 self.all_features = json.load(f)
@@ -372,8 +376,8 @@ def analyze_circuit(text: str) -> Tuple[go.Figure, str, str]:
     hidden, tokens, token_strs = get_activations(text)
     hidden_np = hidden.cpu().numpy()  # [seq_len, d_hidden]
     
-    # Filter out <|endoftext|> (BOS token)
-    valid_indices = [i for i, t in enumerate(token_strs) if t.strip() not in ["<|endoftext|>", ""]]
+    # Filter out special/BOS tokens
+    valid_indices = [i for i, t in enumerate(token_strs) if t.strip() not in _SPECIAL_TOKENS]
     if not valid_indices:
         return go.Figure(), "No valid tokens found.", ""
     
@@ -587,6 +591,169 @@ def analyze_feature_deep(feature_idx: int) -> str:
 
 
 # =============================================================================
+# Medical State (lazy-loaded separately from base model state)
+# =============================================================================
+
+class MedicalState:
+    def __init__(self):
+        self.model = None
+        self.sae = None
+        self.labeled_features = []
+        self.feature_by_index = {}
+        self.device = get_device()
+        self.loaded = False
+        self.error = None
+
+    def load(self):
+        if self.loaded or self.error:
+            return
+
+        med_sae_path = MEDICAL_OUTPUT_DIR / "sae.pt"
+        if not med_sae_path.exists():
+            self.error = f"Medical SAE not found. Run: python main.py"
+            return
+
+        print("Loading medical model...")
+        try:
+            self.model = HookedTransformer.from_pretrained(MODEL_NAME, device=self.device)
+            self.model.eval()
+
+            self.sae = SparseAutoencoder.load(med_sae_path)
+            self.sae.to(self.device)
+            self.sae.eval()
+
+            labeled_path = MEDICAL_OUTPUT_DIR / "labeled_features.json"
+            if labeled_path.exists():
+                with open(labeled_path) as f:
+                    self.labeled_features = json.load(f)
+
+            features_path = MEDICAL_OUTPUT_DIR / "features.json"
+            if features_path.exists():
+                with open(features_path) as f:
+                    all_features = json.load(f)
+                self.feature_by_index = {feat["index"]: feat for feat in all_features}
+
+            self.loaded = True
+            print(f"  Medical model loaded | {len(self.labeled_features)} labeled features")
+        except Exception as e:
+            self.error = f"Failed to load medical model: {e}"
+            print(f"  ERROR: {self.error}")
+
+
+med_state = MedicalState()
+
+
+# =============================================================================
+# Medical Chat & Attribution
+# =============================================================================
+
+def _build_attribution_md(hidden: torch.Tensor) -> str:
+    """Build the attribution panel markdown from SAE hidden activations."""
+    max_per_feature = hidden.max(dim=0).values.cpu()
+    top_vals, top_idxs = max_per_feature.topk(min(8, max_per_feature.shape[0]))
+
+    cat_icon = {"semantic": "🔵", "syntactic": "🟡", "positional": "🟣"}
+
+    md = "## Why did the model say this?\n\n"
+    max_val = top_vals[0].item() if top_vals[0].item() > 0 else 1.0
+
+    for rank, (feat_idx, feat_val) in enumerate(zip(top_idxs.tolist(), top_vals.tolist()), 1):
+        if feat_val <= 0:
+            continue
+
+        # Label lookup
+        label, category, confidence = f"Feature {feat_idx}", "unknown", ""
+        for f in med_state.labeled_features:
+            if f["index"] == feat_idx:
+                label = f.get("label", label)
+                category = f.get("category", "unknown")
+                confidence = f.get("confidence", "")
+                break
+
+        bar_filled = int(feat_val / max_val * 8)
+        bar = "█" * bar_filled + "░" * (8 - bar_filled)
+        icon = cat_icon.get(category, "⚪")
+
+        conf_str = f" · confidence: {confidence}" if confidence else ""
+        md += f"### {rank}. {icon} {label}\n"
+        md += f"`{bar}` **{feat_val:.2f}** · {category}{conf_str}\n\n"
+
+        # Training evidence
+        feat_data = med_state.feature_by_index.get(feat_idx, {})
+        examples = feat_data.get("max_activating_tokens", [])[:3]
+        if examples:
+            md += "**Training evidence:**\n\n"
+            for ex in examples:
+                ctx = ex.get("context", "")
+                token = ex.get("token", "")
+                source = ex.get("source_id", "")
+                ctx_display = ctx.replace(f"[{token}]", f"**[{token}]**") if token else ctx
+                md += f"> {ctx_display}\n\n"
+                if source:
+                    md += f"*Source: {source}*\n\n"
+
+    # VocabProj chips from top 5 features
+    top_feat_list = top_idxs[:5].tolist()
+    try:
+        decoder_cols = med_state.sae.decoder.weight[:, top_feat_list].detach()
+        unembed = med_state.model.W_U.detach()
+        avg_logits = (decoder_cols.T @ unembed).mean(dim=0)
+        top_tok_vals, top_tok_idxs = avg_logits.topk(5)
+        chips = []
+        for tok_id, logit in zip(top_tok_idxs.tolist(), top_tok_vals.tolist()):
+            tok = med_state.model.tokenizer.decode([tok_id]).strip()
+            if tok:
+                chips.append(f"`{tok}` ({logit:.1f})")
+        if chips:
+            md += "**Output tokens promoted:** " + " ".join(chips) + "\n"
+    except Exception:
+        pass
+
+    return md
+
+
+def generate_medical_response(message: str, history: list) -> Tuple[str, str]:
+    """Generate a response from the fine-tuned model and build attribution panel."""
+    med_state.load()
+
+    if med_state.error:
+        return med_state.error, f"*{med_state.error}*"
+
+    # Build prompt from last 3 history turns
+    prompt = ""
+    for user_msg, assistant_msg in (history or [])[-3:]:
+        prompt += f"User: {user_msg}\nAssistant: {assistant_msg}\n"
+    prompt += f"User: {message}\nAssistant:"
+
+    tokens = med_state.model.to_tokens(prompt)
+
+    with torch.no_grad():
+        generated = med_state.model.generate(
+            tokens,
+            max_new_tokens=150,
+            temperature=0.7,
+            top_p=0.9,
+            stop_at_eos=True,
+        )
+
+    response_token_ids = generated[0, tokens.shape[1]:]
+    response = med_state.model.tokenizer.decode(response_token_ids.tolist())
+
+    # Get SAE activations for the generated portion
+    hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
+    with torch.no_grad():
+        _, cache = med_state.model.run_with_cache(generated)
+        activations = cache[hook_point][0]  # [seq_len, d_model]
+        gen_acts = activations[tokens.shape[1]:]
+        if gen_acts.shape[0] == 0:
+            gen_acts = activations
+        hidden = med_state.sae.encode(gen_acts.to(med_state.device))
+
+    attribution_md = _build_attribution_md(hidden)
+    return response, attribution_md
+
+
+# =============================================================================
 # Gradio UI
 # =============================================================================
 
@@ -769,7 +936,7 @@ def build_ui():
                     with gr.Column(scale=1):
                         feature_index_input = gr.Number(
                             value=0,
-                            label="Feature Index (0-8191)",
+                            label=f"Feature Index (0-{8192-1})",
                             precision=0,
                         )
                         analyze_feature_btn = gr.Button("🔍 Analyze Feature", variant="primary")
@@ -828,7 +995,56 @@ def build_ui():
                 
                 refresh_btn = gr.Button("🔄 Refresh")
                 refresh_btn.click(load_features_table, outputs=[features_table])
-    
+
+            # =================================================================
+            # Tab 6: Medical Chat + Attribution
+            # =================================================================
+            with gr.Tab("🏥 Medical Chat + Attribution"):
+                gr.Markdown("""
+                ### Medical Chat with Training Data Attribution
+                Ask medical questions and see **which features activated** and
+                **which training passages** influenced the response.
+
+                > Requires: `python finetune.py` then `python main.py --dataset medical`
+                """)
+
+                with gr.Row():
+                    # Left column — chat
+                    with gr.Column(scale=1):
+                        chatbot = gr.Chatbot(label="Medical Chat", height=450)
+                        chat_input = gr.Textbox(
+                            label="Your question",
+                            placeholder="e.g. What are the symptoms of myocardial infarction?",
+                            lines=2,
+                        )
+                        with gr.Row():
+                            chat_submit = gr.Button("Send", variant="primary")
+                            chat_clear = gr.Button("Clear")
+
+                    # Right column — live attribution
+                    with gr.Column(scale=1):
+                        attribution_out = gr.Markdown(
+                            "*Send a message to see training data attribution.*",
+                            label="Attribution Panel",
+                        )
+
+                def on_chat(message, history):
+                    if not message.strip():
+                        return history, "", "*Enter a message first.*"
+                    response, attribution_md = generate_medical_response(message, history)
+                    history = (history or []) + [(message, response)]
+                    return history, "", attribution_md
+
+                chat_submit.click(
+                    on_chat,
+                    inputs=[chat_input, chatbot],
+                    outputs=[chatbot, chat_input, attribution_out],
+                )
+                chat_clear.click(
+                    lambda: ([], "", "*Send a message to see training data attribution.*"),
+                    outputs=[chatbot, chat_input, attribution_out],
+                )
+
     return app
 
 

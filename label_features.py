@@ -36,7 +36,7 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 load_dotenv()
 
-from config import OUTPUT_DIR, FEATURES_PATH
+from config import MEDICAL_OUTPUT_DIR, MEDICAL_FEATURES_PATH
 
 MAX_TOKENS_PER_SEQ = 128  # must match max_tokens in collect_activations
 
@@ -57,14 +57,40 @@ class LabeledFeature:
     quality_score: float = 0.0
     label_source: str = "openai"   # "openai" | "heuristic_token" | "heuristic_positional" | "heuristic_pos"
 
-    @property
-    def category(self) -> str:
-        """High-level feature category: semantic / syntactic / positional."""
-        if self.label_source == "heuristic_positional":
-            return "positional"
-        if self.label_source in ("heuristic_token", "heuristic_pos"):
-            return "syntactic"
-        return "semantic"
+
+# =============================================================================
+# OpenAI API
+# =============================================================================
+
+def call_openai(prompt: str, model: str = "gpt-4o-mini") -> str:
+    """Call OpenAI API (using v1.x SDK)."""
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert in mechanistic interpretability of neural networks. "
+                        "Your task is to label features extracted from a Sparse Autoencoder (SAE) trained on Llama 3.2 1B processing medical text. "
+                        "MaxAct tokens are real input tokens that triggered the feature (what it detects). "
+                        "VocabProj tokens are output tokens the feature promotes (what it causes). "
+                        "Give specific, concrete labels — avoid vague terms like 'language patterns', 'text features', 'linguistic', or 'general concepts'."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=2000,
+        )
+        return response.choices[0].message.content.strip()
+    except ImportError:
+        raise ImportError("Please install openai: pip install 'openai>=1.0.0'")
+    except Exception as e:
+        raise RuntimeError(f"OpenAI API error: {e}")
 
 
 # =============================================================================
@@ -470,7 +496,7 @@ VocabProj (promotes, logit boost): {', '.join(vocab_parts) if vocab_parts else '
 ---
 """
 
-    prompt = f"""Analyze these neural network features from a Sparse Autoencoder trained on GPT-2 Medium.
+    prompt = f"""Analyze these neural network features from a Sparse Autoencoder trained on Llama 3.2 1B processing medical text.
 
 For each feature:
 - MaxAct = tokens (with activation strength) that TRIGGER the feature (input-centric)
@@ -628,7 +654,10 @@ def label_features(
 
             labeled_ids = set()
             for feature_id, label, confidence, reasoning in results:
-                if label.upper() != "UNLABELED":
+                if feature_id in labeled_ids:
+                    continue  # skip duplicates from same batch
+                labeled_ids.add(feature_id)
+                if "UNLABELED" not in label.upper():
                     max_act, vocab_proj = extract_feature_tokens(feature_lookup[feature_id])
                     openai_labeled.append(LabeledFeature(
                         index=feature_id,
@@ -640,10 +669,8 @@ def label_features(
                         quality_score=quality_scores[feature_id],
                         label_source="openai",
                     ))
-                    labeled_ids.add(feature_id)
                 else:
                     unlabeled_count += 1
-                    labeled_ids.add(feature_id)
 
             unlabeled_count += len(batch) - len(labeled_ids)
 
@@ -775,13 +802,15 @@ def main():
                         help="Disable quality filter for OpenAI candidates")
     args = parser.parse_args()
 
-    if not FEATURES_PATH.exists():
-        print(f"Error: {FEATURES_PATH} not found. Run main.py first.")
+    # Load features from medical_outputs
+    if not MEDICAL_FEATURES_PATH.exists():
+        print(f"Error: {MEDICAL_FEATURES_PATH} not found. Run main.py first.")
         return
 
-    with open(FEATURES_PATH) as f:
+    with open(MEDICAL_FEATURES_PATH) as f:
         features = json.load(f)
-    print(f"Loaded {len(features)} features from {FEATURES_PATH}")
+
+    print(f"Loaded {len(features)} features from {MEDICAL_FEATURES_PATH}")
 
     labeled_features = label_features(
         features,
@@ -802,7 +831,8 @@ def main():
 
     print_labeled_features(labeled_features)
 
-    output_path = Path(args.output) if args.output else OUTPUT_DIR / "labeled_features.json"
+    # Save results
+    output_path = Path(args.output) if args.output else MEDICAL_OUTPUT_DIR / "labeled_features.json"
     save_labeled_features(labeled_features, output_path)
 
 

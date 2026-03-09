@@ -16,31 +16,36 @@ from typing import List
 # Configuration Constants
 # =============================================================================
 
-# Model: GPT-2 Medium (355M params, richer representations)
-MODEL_NAME = "gpt2-medium"
-D_MODEL = 1024
-N_LAYERS = 24
+# Model: Llama 3.2 1B (instruction-tuned available at meta-llama/Llama-3.2-1B-Instruct)
+MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
+D_MODEL = 2048
+N_LAYERS = 16
 
 # Layer: Middle layer for semantic features (lit review: features are most interpretable here)
-TARGET_LAYER = 12  # Middle of 24 layers
+TARGET_LAYER = 8  # Middle of 16 layers
 HOOK_TYPE = "resid_post"
 
 # SAE: TopK architecture (Gao et al. 2024) — activates exactly K features per token.
 # Eliminates L1 tuning, ghost gradients, and dead neurons by construction.
-EXPANSION_FACTOR = 8  # Hidden dim = 1024 * 8 = 8192 features
-TOP_K = 100           # Exactly 100 features active per token (L0 = K, always)
-AUX_COEFF = 1 / 32   # Auxiliary loss weight (Gao et al. 2024): gives dead features gradient signal
+EXPANSION_FACTOR = 4  # Hidden dim = 2048 * 4 = 8192 features
+TOP_K = 64            # 64 features active per token (was 32, too sparse → dead features)
+AUX_COEFF = 1 / 16    # Auxiliary loss for dead feature gradient signal
 
 # Training
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 5
+NUM_EPOCHS = 5        # More epochs to let features learn (was 2)
 BATCH_SIZE = 4096
-NUM_SAMPLES = 500_000
+NUM_SAMPLES = 100_000
 
 # Output
 OUTPUT_DIR = Path("outputs")
 SAE_PATH = OUTPUT_DIR / "sae.pt"
 FEATURES_PATH = OUTPUT_DIR / "features.json"
+
+# Medical outputs (separate directory in project root)
+MEDICAL_OUTPUT_DIR = Path("medical_outputs")
+MEDICAL_SAE_PATH = MEDICAL_OUTPUT_DIR / "sae.pt"
+MEDICAL_FEATURES_PATH = MEDICAL_OUTPUT_DIR / "features.json"
 
 
 # =============================================================================
@@ -72,20 +77,14 @@ class SAEOutput:
 
 
 @dataclass
-class ActivationData:
-    """Container for activations and their corresponding token IDs."""
-    activations: torch.Tensor  # [n_tokens, d_model]
-    token_ids: torch.Tensor    # [n_tokens] - the actual input tokens
-
-
-@dataclass
 class MaxActExample:
     """A single example of a token that strongly activates a feature."""
     token: str
     token_id: int
     activation: float
-    context: str = ""           # ±5 token window with [TOKEN] marker
+    context: str = ""           # ±50 token window with [TOKEN] marker
     global_token_idx: int = -1  # position in flat token_ids tensor
+    source_id: str = ""         # which training document this came from
 
 
 @dataclass
