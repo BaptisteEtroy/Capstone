@@ -362,6 +362,7 @@ def analyze_features(
     token_ids: torch.Tensor,
     chunk_files: List[Path],
     top_k: int = 20,
+    max_tokens: int = 128,
     device: Optional[str] = None,
     source_ids: Optional[torch.Tensor] = None,
     source_list: Optional[List[str]] = None,
@@ -467,9 +468,20 @@ def analyze_features(
 
     max_act_values = {}
     max_act_indices = {}
+    max_act_positions = {}  # (mean, std) of token position-in-sequence
     for f_pos, feat_idx in enumerate(top_feature_indices):
         max_act_values[feat_idx] = running_vals[:, f_pos]
         max_act_indices[feat_idx] = running_idxs[:, f_pos]
+        # Position within each sequence: global_idx % max_tokens
+        # (valid since all sequences are truncated/padded to exactly max_tokens)
+        valid_mask = running_vals[:, f_pos] > 0
+        if valid_mask.any():
+            positions = (running_idxs[:, f_pos][valid_mask].float() % max_tokens)
+            pos_mean = positions.mean().item()
+            pos_std = positions.std().item() if valid_mask.sum() > 1 else 0.0
+        else:
+            pos_mean, pos_std = 0.0, 0.0
+        max_act_positions[feat_idx] = (pos_mean, pos_std)
     
     # =========================================================================
     # Output-centric: VocabProj - Project decoder vectors onto vocabulary
@@ -534,6 +546,7 @@ def analyze_features(
             vocab_tokens.append(tok_str)
             vocab_logit_values.append(logit_val)
         
+        pos_mean, pos_std = max_act_positions.get(feat_idx, (0.0, 0.0))
         info = FeatureInfo(
             index=feat_idx,
             activation_frequency=feature_freq[feat_idx].item(),
@@ -542,6 +555,8 @@ def analyze_features(
             max_activating_tokens=max_act_examples[:10],
             vocab_projection=vocab_tokens,
             vocab_projection_logits=vocab_logit_values,
+            position_mean=pos_mean,
+            position_std=pos_std,
         )
         features_info.append(info)
     
@@ -628,6 +643,9 @@ def save_results(
             ],
             "vocab_projection": f.vocab_projection,
             "vocab_projection_logits": f.vocab_projection_logits,
+            # Positional: where in the sequence this feature tends to fire
+            "position_mean": round(f.position_mean, 2),
+            "position_std": round(f.position_std, 2),
         }
         for f in features_info
     ]
