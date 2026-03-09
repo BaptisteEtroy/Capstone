@@ -36,7 +36,7 @@ _SPECIAL_TOKENS = {"<|endoftext|>", "<|begin_of_text|>", "<|end_of_text|>", "<|e
 def get_feature_choices() -> List[str]:
     """Get list of labeled features for dropdown, sorted by confidence."""
     try:
-        with open(OUTPUT_DIR / "labeled_features.json") as f:
+        with open(MEDICAL_OUTPUT_DIR / "labeled_features.json") as f:
             features = json.load(f)
         
         # Sort by confidence (high first)
@@ -81,17 +81,17 @@ class AppState:
         self.model.to(self.device)
         self.model.eval()
         
-        # Load SAE
-        self.sae = SparseAutoencoder.load(SAE_PATH)
+        # Load SAE from medical outputs
+        self.sae = SparseAutoencoder.load(MEDICAL_OUTPUT_DIR / "sae.pt")
         self.sae.to(self.device)
         self.sae.eval()
         
-        # Load labeled features
-        with open(OUTPUT_DIR / "labeled_features.json") as f:
+        # Load labeled features from medical outputs
+        with open(MEDICAL_OUTPUT_DIR / "labeled_features.json") as f:
             self.labeled_features = json.load(f)
         
         # Load ALL features (for circuit analysis)
-        features_path = OUTPUT_DIR / "features.json"
+        features_path = MEDICAL_OUTPUT_DIR / "features.json"
         if features_path.exists():
             with open(features_path) as f:
                 self.all_features = json.load(f)

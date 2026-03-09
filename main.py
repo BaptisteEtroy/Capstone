@@ -136,21 +136,26 @@ def collect_activations(
             tokens = model.to_tokens(batch_texts)
             if tokens.shape[1] > max_tokens:
                 tokens = tokens[:, :max_tokens]
-            seq_len = tokens.shape[1]
 
             _, cache = model.run_with_cache(tokens, names_filter=[hook_point])
-            acts = cache[hook_point].reshape(-1, D_MODEL).cpu()
-            all_activations.append(acts)
-            all_token_ids.append(tokens.reshape(-1).cpu())
+            acts_batch = cache[hook_point].cpu()  # [batch, seq_len, d_model]
 
-            # Track source per token (each sequence contributes seq_len tokens)
-            for src_id in batch_sources:
+            # Filter out padding positions per sequence (Llama uses <|eot_id|> as pad)
+            pad_id = model.tokenizer.pad_token_id or model.tokenizer.eos_token_id
+            for i, src_id in enumerate(batch_sources):
+                real_mask = tokens[i].cpu() != pad_id
+                real_toks = tokens[i].cpu()[real_mask]
+                real_acts = acts_batch[i][real_mask]
+                if real_toks.shape[0] == 0:
+                    continue
+                all_activations.append(real_acts)
+                all_token_ids.append(real_toks)
                 if src_id not in source_name_to_idx:
                     source_name_to_idx[src_id] = len(source_list)
                     source_list.append(src_id)
-                all_source_idxs.extend([source_name_to_idx[src_id]] * seq_len)
+                all_source_idxs.extend([source_name_to_idx[src_id]] * real_toks.shape[0])
 
-            del cache
+            del cache, acts_batch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             batch_texts = []
@@ -176,17 +181,22 @@ def collect_activations(
         tokens = model.to_tokens(batch_texts)
         if tokens.shape[1] > max_tokens:
             tokens = tokens[:, :max_tokens]
-        seq_len = tokens.shape[1]
         _, cache = model.run_with_cache(tokens, names_filter=[hook_point])
-        acts = cache[hook_point].reshape(-1, D_MODEL).cpu()
-        all_activations.append(acts)
-        all_token_ids.append(tokens.reshape(-1).cpu())
-        for src_id in batch_sources:
+        acts_batch = cache[hook_point].cpu()
+        pad_id = model.tokenizer.pad_token_id or model.tokenizer.eos_token_id
+        for i, src_id in enumerate(batch_sources):
+            real_mask = tokens[i].cpu() != pad_id
+            real_toks = tokens[i].cpu()[real_mask]
+            real_acts = acts_batch[i][real_mask]
+            if real_toks.shape[0] == 0:
+                continue
+            all_activations.append(real_acts)
+            all_token_ids.append(real_toks)
             if src_id not in source_name_to_idx:
                 source_name_to_idx[src_id] = len(source_list)
                 source_list.append(src_id)
-            all_source_idxs.extend([source_name_to_idx[src_id]] * seq_len)
-        del cache
+            all_source_idxs.extend([source_name_to_idx[src_id]] * real_toks.shape[0])
+        del cache, acts_batch
 
     pbar.close()
 
@@ -678,7 +688,7 @@ def main():
     print("\n" + "="*60)
     print("  Medical SAE Pipeline")
     print(f"  Model: {MODEL_NAME} | Layer: {TARGET_LAYER} | Hook: {HOOK_TYPE}")
-    print(f"  Dataset: medmcqa + pubmed_qa | Output: {output_dir}")
+    print(f"  Dataset: pubmed_summarization + pubmed_qa | Output: {output_dir}")
     print("="*60)
     if args.quick:
         print("  [QUICK TEST MODE]")

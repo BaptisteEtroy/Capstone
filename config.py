@@ -27,15 +27,15 @@ HOOK_TYPE = "resid_post"
 
 # SAE: TopK architecture (Gao et al. 2024) — activates exactly K features per token.
 # Eliminates L1 tuning, ghost gradients, and dead neurons by construction.
-EXPANSION_FACTOR = 4  # Hidden dim = 2048 * 4 = 8192 features (same count as before)
-TOP_K = 32            # Exactly 32 features active per token — sparser, more monosemantic
-AUX_COEFF = 1 / 8    # Higher aux weight for structured medical text (more dead feature signal)
+EXPANSION_FACTOR = 4  # Hidden dim = 2048 * 4 = 8192 features
+TOP_K = 64            # 64 features active per token (was 32, too sparse → dead features)
+AUX_COEFF = 1 / 16    # Auxiliary loss for dead feature gradient signal
 
 # Training
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 2
+NUM_EPOCHS = 5        # More epochs to let features learn (was 2)
 BATCH_SIZE = 4096
-NUM_SAMPLES = 200_000
+NUM_SAMPLES = 100_000
 
 # Output
 OUTPUT_DIR = Path("outputs")
