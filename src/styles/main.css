@@ -68,7 +68,7 @@
   --sidebar-dur: 200ms;
 
   /* Attribution panel */
-  --attr-w: 320px;
+  --attr-w: 420px;
 
   /* Motion */
   --ease: cubic-bezier(0.4, 0, 0.2, 1);
