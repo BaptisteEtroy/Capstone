@@ -21,3 +21,8 @@ openai>=1.0.0,<1.57.0
 # UI / Visualization
 gradio>=4.0.0
 plotly>=5.18.0
+
+# New web server (replaces Gradio for custom HTML/JS/CSS UI)
+fastapi>=0.110.0
+uvicorn>=0.27.0
+python-multipart>=0.0.9

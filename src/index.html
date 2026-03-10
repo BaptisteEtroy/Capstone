@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SAE Lab — Interpretability Interface</title>
+  <meta name="description" content="Sparse Autoencoder feature extraction and behaviour control. Visualise which learned features shape every model response." />
+  <meta name="robots" content="noindex" />
+
+  <!-- Open Graph -->
+  <meta property="og:title" content="SAE Lab" />
+  <meta property="og:description" content="Neural interpretability interface — feature extraction, attribution, and behaviour steering." />
+  <meta property="og:type" content="website" />
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=IBM+Plex+Sans:wght@300;400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <!-- D3 -->
+  <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+
+  <!-- Styles -->
+  <link rel="stylesheet" href="/styles/main.css" />
+</head>
+<body>
+
+<div id="app">
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       SIDEBAR
+  ════════════════════════════════════════════════════════════════════════ -->
+  <aside id="sidebar" class="sidebar" aria-label="Application navigation">
+
+    <div class="sidebar-top">
+      <div class="logo">
+        <div class="logo-mark" aria-hidden="true">
+          <svg viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="1" y="1" width="20" height="20" rx="3" stroke="currentColor" stroke-width="1" opacity=".25"/>
+            <circle cx="11" cy="11" r="2" fill="currentColor" opacity=".7"/>
+            <circle cx="5"  cy="5"  r="1.2" fill="currentColor" opacity=".35"/>
+            <circle cx="17" cy="5"  r="1.2" fill="currentColor" opacity=".35"/>
+            <circle cx="5"  cy="17" r="1.2" fill="currentColor" opacity=".35"/>
+            <circle cx="17" cy="17" r="1.2" fill="currentColor" opacity=".35"/>
+            <line x1="6.2" y1="6.2" x2="9.4" y2="9.4" stroke="currentColor" stroke-width=".6" opacity=".25"/>
+            <line x1="15.8" y1="6.2" x2="12.6" y2="9.4" stroke="currentColor" stroke-width=".6" opacity=".25"/>
+            <line x1="6.2" y1="15.8" x2="9.4" y2="12.6" stroke="currentColor" stroke-width=".6" opacity=".25"/>
+            <line x1="15.8" y1="15.8" x2="12.6" y2="12.6" stroke="currentColor" stroke-width=".6" opacity=".25"/>
+          </svg>
+        </div>
+        <span class="logo-text">SAE Lab</span>
+      </div>
+      <button
+        id="sidebar-toggle"
+        class="sidebar-toggle"
+        aria-label="Collapse sidebar"
+        aria-expanded="true"
+        aria-controls="sidebar"
+      >
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <path d="M13 5L8 10L13 15"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Nav tabs -->
+    <nav class="sidebar-nav" role="tablist" aria-label="Main navigation">
+
+      <button
+        class="nav-item active"
+        role="tab"
+        data-tab="chat"
+        aria-selected="true"
+        aria-controls="panel-chat"
+        id="tab-chat"
+        title="Chat"
+      >
+        <span class="nav-icon" aria-hidden="true">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M17.5 13.5A2 2 0 0 1 15.5 15.5H6L2.5 19V4.5A2 2 0 0 1 4.5 2.5H15.5A2 2 0 0 1 17.5 4.5Z"/>
+          </svg>
+        </span>
+        <span class="nav-label">Chat</span>
+      </button>
+
+      <button
+        class="nav-item"
+        role="tab"
+        data-tab="steer"
+        aria-selected="false"
+        aria-controls="panel-steer"
+        id="tab-steer"
+        title="Feature Steering"
+      >
+        <span class="nav-icon" aria-hidden="true">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="10" cy="10" r="2.5"/>
+            <path d="M16.2 3.8A9 9 0 0 1 16.2 16.2"/>
+            <path d="M3.8 3.8A9 9 0 0 0 3.8 16.2"/>
+            <path d="M13.5 6.5A5 5 0 0 1 13.5 13.5"/>
+            <path d="M6.5 6.5A5 5 0 0 0 6.5 13.5"/>
+          </svg>
+        </span>
+        <span class="nav-label">Steer</span>
+      </button>
+
+      <button
+        class="nav-item"
+        role="tab"
+        data-tab="explore"
+        aria-selected="false"
+        aria-controls="panel-explore"
+        id="tab-explore"
+        title="Circuit Explorer"
+      >
+        <span class="nav-icon" aria-hidden="true">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5">
+            <polygon points="10 2 12.9 7.3 18.8 8.2 14.4 12.5 15.4 18.4 10 15.5 4.6 18.4 5.6 12.5 1.2 8.2 7.1 7.3"/>
+          </svg>
+        </span>
+        <span class="nav-label">Explore</span>
+      </button>
+
+      <button
+        class="nav-item"
+        role="tab"
+        data-tab="features"
+        aria-selected="false"
+        aria-controls="panel-features"
+        id="tab-features"
+        title="Feature Browser"
+      >
+        <span class="nav-icon" aria-hidden="true">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5">
+            <rect x="2" y="2" width="7" height="7" rx=".5"/>
+            <rect x="11" y="2" width="7" height="7" rx=".5"/>
+            <rect x="2" y="11" width="7" height="7" rx=".5"/>
+            <rect x="11" y="11" width="7" height="7" rx=".5"/>
+          </svg>
+        </span>
+        <span class="nav-label">Features</span>
+      </button>
+
+    </nav>
+
+    <!-- Chat history (visible in Chat tab) -->
+    <div class="sidebar-history" id="sidebar-history" aria-label="Conversation history">
+      <div class="history-label">History</div>
+      <div id="history-list" class="history-list" role="list"></div>
+      <button class="new-chat-btn" id="new-chat-btn" aria-label="Start new conversation">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <line x1="10" y1="4" x2="10" y2="16"/>
+          <line x1="4" y1="10" x2="16" y2="10"/>
+        </svg>
+        New chat
+      </button>
+    </div>
+
+    <!-- Status bar -->
+    <div class="sidebar-status" id="sidebar-status">
+      <div class="status-indicator" id="status-indicator" data-state="loading" aria-live="polite">
+        <div class="status-dot" aria-hidden="true"></div>
+        <span id="status-text">Connecting…</span>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       MAIN CONTENT
+  ════════════════════════════════════════════════════════════════════════ -->
+  <div id="main" class="main-wrapper">
+
+    <!-- ─── CHAT PANEL ──────────────────────────────────────────────── -->
+    <section
+      id="panel-chat"
+      class="panel active"
+      role="tabpanel"
+      aria-labelledby="tab-chat"
+    >
+      <div class="chat-layout" id="chat-layout">
+
+        <!-- Chat column -->
+        <div class="chat-col" id="chat-col">
+
+          <header class="chat-header">
+            <div class="chat-header-left">
+              <h1 class="chat-heading">Chat</h1>
+              <span class="model-chip" id="model-chip">
+                Llama 3.2 1B · SAE L8
+              </span>
+            </div>
+            <div class="chat-header-right">
+              <button
+                class="icon-btn active"
+                id="attr-toggle"
+                aria-pressed="true"
+                aria-label="Toggle attribution panel"
+                title="Attribution panel"
+              >
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                  <circle cx="6" cy="10" r="2"/>
+                  <circle cx="14" cy="5" r="2"/>
+                  <circle cx="14" cy="15" r="2"/>
+                  <line x1="8" y1="10" x2="12" y2="6"/>
+                  <line x1="8" y1="10" x2="12" y2="14"/>
+                </svg>
+              </button>
+            </div>
+          </header>
+
+          <div id="messages" class="messages" role="log" aria-label="Conversation" aria-live="polite">
+            <!-- Welcome state -->
+            <div class="welcome" id="welcome">
+              <h2 class="welcome-title">SAE Interpretability Lab</h2>
+              <p class="welcome-sub">Ask a question and observe which sparse autoencoder features activate — tracing how the model maps inputs to outputs through learned representations.</p>
+              <div class="example-chips" role="list" aria-label="Example prompts">
+                <button class="example-chip" role="listitem" data-prompt="What are the main symptoms of myocardial infarction?">Myocardial infarction</button>
+                <button class="example-chip" role="listitem" data-prompt="How do beta-blockers lower blood pressure?">Beta-blocker mechanism</button>
+                <button class="example-chip" role="listitem" data-prompt="What is the difference between type 1 and type 2 diabetes?">Type 1 vs Type 2 diabetes</button>
+                <button class="example-chip" role="listitem" data-prompt="Explain the blood-brain barrier.">Blood-brain barrier</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="chat-input-wrap">
+            <form id="chat-form" class="chat-form" novalidate>
+              <div class="input-shell">
+                <textarea
+                  id="chat-input"
+                  class="chat-input"
+                  placeholder="Ask a medical question…"
+                  rows="1"
+                  aria-label="Message"
+                  aria-required="true"
+                  autocomplete="off"
+                  spellcheck="true"
+                ></textarea>
+                <button
+                  type="submit"
+                  id="send-btn"
+                  class="send-btn"
+                  aria-label="Send message"
+                  disabled
+                >
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                    <line x1="18" y1="2" x2="9" y2="11"/>
+                    <polygon points="18 2 12 18 9 11 2 8"/>
+                  </svg>
+                </button>
+              </div>
+            </form>
+            <p class="input-hint">Medical domain · Llama 3.2 1B-Instruct · SAE Layer 8 · TopK-64</p>
+          </div>
+
+        </div>
+
+        <!-- Attribution panel -->
+        <aside
+          id="attr-panel"
+          class="attr-panel"
+          aria-label="Feature attribution"
+          aria-live="polite"
+        >
+          <div class="attr-panel-header">
+            <h2 class="attr-title">Attribution</h2>
+            <div class="attr-view-tabs" role="tablist" aria-label="Attribution view">
+              <button class="attr-view-tab active" data-view="graph" role="tab" aria-selected="true">Graph</button>
+              <button class="attr-view-tab" data-view="list" role="tab" aria-selected="false">List</button>
+            </div>
+          </div>
+
+          <!-- Empty state -->
+          <div class="attr-empty" id="attr-empty" aria-label="No attribution data">
+            <div class="attr-empty-icon" aria-hidden="true">
+              <svg viewBox="0 0 56 56" fill="none">
+                <circle cx="28" cy="28" r="5" fill="var(--border-default)" opacity=".6"/>
+                <circle cx="10" cy="14" r="3.5" fill="var(--border-default)" opacity=".4"/>
+                <circle cx="46" cy="14" r="3.5" fill="var(--border-default)" opacity=".4"/>
+                <circle cx="10" cy="42" r="3.5" fill="var(--border-default)" opacity=".4"/>
+                <circle cx="46" cy="42" r="3.5" fill="var(--border-default)" opacity=".4"/>
+                <line x1="13" y1="15" x2="24" y2="24" stroke="var(--border-default)" stroke-width="1" opacity=".3"/>
+                <line x1="43" y1="15" x2="32" y2="24" stroke="var(--border-default)" stroke-width="1" opacity=".3"/>
+              </svg>
+            </div>
+            <p>Send a message to see which features activate</p>
+          </div>
+
+          <!-- Graph view -->
+          <div class="attr-view" id="attr-graph-view" hidden>
+            <div id="attr-graph" class="attr-graph" aria-label="Attribution graph"></div>
+          </div>
+
+          <!-- List view -->
+          <div class="attr-view" id="attr-list-view" hidden>
+            <div class="attr-section">
+              <div class="attr-section-title">
+                <span class="section-dot input-dot"></span>
+                Input features
+                <span class="section-count" id="input-count">—</span>
+              </div>
+              <div id="input-features" class="feature-card-list" role="list" aria-label="Input features"></div>
+            </div>
+            <div class="attr-section">
+              <div class="attr-section-title">
+                <span class="section-dot output-dot"></span>
+                Output features
+                <span class="section-count" id="output-count">—</span>
+              </div>
+              <div id="output-features" class="feature-card-list" role="list" aria-label="Output features"></div>
+            </div>
+          </div>
+
+        </aside>
+
+      </div>
+    </section>
+
+    <!-- ─── STEER PANEL ──────────────────────────────────────────────── -->
+    <section
+      id="panel-steer"
+      class="panel"
+      role="tabpanel"
+      aria-labelledby="tab-steer"
+      hidden
+    >
+      <div class="steer-layout">
+
+        <div class="steer-sidebar">
+          <header class="panel-header">
+            <h1>Feature Steering</h1>
+            <p>Amplify or suppress SAE features during generation to observe causal effects on output.</p>
+          </header>
+
+          <div class="form-block">
+            <label class="form-label" for="steer-prompt">Prompt</label>
+            <textarea id="steer-prompt" class="form-textarea" rows="4" placeholder="Enter a prompt…"></textarea>
+          </div>
+
+          <div class="form-block">
+            <label class="form-label">Active features</label>
+            <div id="steer-active-features" class="steer-active-list" aria-label="Active steering features">
+              <div class="steer-empty-hint">
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                  <line x1="10" y1="4" x2="10" y2="16"/><line x1="4" y1="10" x2="16" y2="10"/>
+                </svg>
+                Search features below to add
+              </div>
+            </div>
+          </div>
+
+          <div class="form-block">
+            <label class="form-label" for="steer-search">Search features</label>
+            <div class="search-wrapper">
+              <svg class="search-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                <circle cx="9" cy="9" r="6"/><line x1="14" y1="14" x2="18" y2="18"/>
+              </svg>
+              <input type="text" id="steer-search" class="search-input" placeholder="Search by label or index…" aria-label="Search features to add" autocomplete="off" />
+            </div>
+            <div id="steer-search-results" class="search-results-dropdown" role="listbox" aria-label="Feature search results" hidden></div>
+          </div>
+
+          <div class="form-block">
+            <label class="form-label" for="steer-tokens">
+              Max tokens <span class="form-value" id="steer-tokens-val">150</span>
+            </label>
+            <input type="range" id="steer-tokens" class="range-input" min="30" max="400" value="150" aria-label="Max tokens" />
+          </div>
+
+          <button class="primary-btn" id="steer-run-btn">
+            Generate
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <polygon points="4 3 16 10 4 17"/>
+            </svg>
+          </button>
+        </div>
+
+        <div class="steer-outputs">
+          <div class="steer-output-card">
+            <div class="steer-output-label">Baseline</div>
+            <div id="steer-baseline" class="steer-output-text" aria-live="polite" aria-label="Baseline output">—</div>
+          </div>
+          <div class="steer-output-card steered">
+            <div class="steer-output-label">
+              Steered
+              <span class="steer-badge" id="steer-badge" hidden></span>
+            </div>
+            <div id="steer-steered" class="steer-output-text" aria-live="polite" aria-label="Steered output">—</div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ─── EXPLORE PANEL ─────────────────────────────────────────────── -->
+    <section
+      id="panel-explore"
+      class="panel"
+      role="tabpanel"
+      aria-labelledby="tab-explore"
+      hidden
+    >
+      <div class="explore-layout">
+
+        <header class="panel-header">
+          <h1>Circuit Explorer</h1>
+          <p>Trace which SAE features activate for any text and visualise the computation circuit.</p>
+        </header>
+
+        <div class="explore-input-block">
+          <label class="form-label" for="explore-text">Input text</label>
+          <div class="explore-input-row">
+            <textarea id="explore-text" class="form-textarea explore-textarea" rows="2" placeholder="Enter text to analyse…"></textarea>
+            <button class="primary-btn" id="explore-run-btn" aria-label="Analyse circuit">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <circle cx="9" cy="9" r="6"/><line x1="14" y1="14" x2="18" y2="18"/>
+              </svg>
+              Analyse
+            </button>
+          </div>
+        </div>
+
+        <div id="explore-results" class="explore-results" hidden aria-live="polite">
+          <div class="explore-tokens-row" id="explore-tokens" aria-label="Input tokens"></div>
+          <div class="explore-circuit-wrap">
+            <div id="explore-circuit" class="explore-circuit" aria-label="Circuit diagram"></div>
+          </div>
+          <div id="explore-feature-table" class="explore-feature-table" aria-label="Activated features table"></div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ─── FEATURES PANEL ───────────────────────────────────────────── -->
+    <section
+      id="panel-features"
+      class="panel"
+      role="tabpanel"
+      aria-labelledby="tab-features"
+      hidden
+    >
+      <div class="features-layout">
+
+        <header class="panel-header features-header-row">
+          <div>
+            <h1>Feature Browser</h1>
+            <p><span id="features-total">—</span> labeled SAE features</p>
+          </div>
+        </header>
+
+        <div class="features-toolbar">
+          <div class="search-wrapper">
+            <svg class="search-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+              <circle cx="9" cy="9" r="6"/><line x1="14" y1="14" x2="18" y2="18"/>
+            </svg>
+            <input type="text" id="feat-search" class="search-input" placeholder="Search labels…" aria-label="Search features" autocomplete="off" />
+          </div>
+          <div class="conf-filter" role="group" aria-label="Filter by confidence">
+            <button class="filter-pill active" data-conf="" aria-pressed="true">All</button>
+            <button class="filter-pill" data-conf="high" aria-pressed="false">High</button>
+            <button class="filter-pill" data-conf="medium" aria-pressed="false">Medium</button>
+            <button class="filter-pill" data-conf="low" aria-pressed="false">Low</button>
+          </div>
+        </div>
+
+        <div id="features-grid" class="features-grid" role="list" aria-label="Feature cards" aria-live="polite"></div>
+
+        <div id="features-pagination" class="pagination" aria-label="Pagination"></div>
+
+      </div>
+
+      <!-- Feature detail drawer -->
+      <div id="feat-drawer" class="feat-drawer" hidden aria-modal="true" role="dialog" aria-labelledby="feat-drawer-title">
+        <div class="feat-drawer-backdrop" id="feat-drawer-backdrop"></div>
+        <div class="feat-drawer-panel" tabindex="-1">
+          <div class="feat-drawer-header">
+            <div class="feat-drawer-meta">
+              <span class="feat-drawer-index" id="feat-drawer-index"></span>
+              <span class="feat-drawer-conf" id="feat-drawer-conf"></span>
+            </div>
+            <button class="icon-btn" id="feat-drawer-close" aria-label="Close">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <line x1="5" y1="5" x2="15" y2="15"/><line x1="15" y1="5" x2="5" y2="15"/>
+              </svg>
+            </button>
+          </div>
+          <h2 id="feat-drawer-title" class="feat-drawer-title"></h2>
+          <div id="feat-drawer-body" class="feat-drawer-body"></div>
+        </div>
+      </div>
+
+    </section>
+
+  </div><!-- /main-wrapper -->
+
+</div><!-- /app -->
+
+<!-- Loading overlay -->
+<div id="loading-overlay" class="loading-overlay" aria-hidden="true">
+  <div class="loading-spinner" aria-hidden="true"></div>
+</div>
+
+<!-- Scripts -->
+<script type="module" src="/scripts/app.js"></script>
+
+</body>
+</html>
