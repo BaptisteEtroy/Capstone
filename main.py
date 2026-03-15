@@ -18,7 +18,6 @@ import argparse
 import json
 
 from transformer_lens import HookedTransformer
-from datasets import load_dataset
 
 # Import all config and shared classes
 from config import (
@@ -28,6 +27,7 @@ from config import (
     get_device,
     SparseAutoencoder, MaxActExample, FeatureInfo,
 )
+from dataset import stream_medical_texts
 
 
 # =============================================================================
@@ -44,43 +44,13 @@ def load_model(device: Optional[str] = None) -> HookedTransformer:
     return model
 
 
-# =============================================================================
-# Medical Dataset Helpers
-# =============================================================================
+# Llama 3.2 special token IDs — excluded from MaxAct analysis.
+# These structural tokens fire based on format, not semantics, and contaminate labeling.
+# 128000=<|begin_of_text|>  128001=<|end_of_text|>  128006=<|start_header_id|>
+# 128007=<|end_header_id|>  128008=<|eot_id|> (some configs)  128009=<|eot_id|>
+_LLAMA_SPECIAL_IDS = {128000, 128001, 128006, 128007, 128008, 128009}
 
-def _stream_texts(num_samples: int, max_tokens: int):
-    """Yield (text, source_id) tuples from raw PubMed abstracts + PubMed QA contexts."""
-    count = 0
-    half = num_samples // 2
 
-    # ccdv/pubmed-summarization — raw PubMed abstracts (~119k train samples)
-    # Plain prose medical language, no MCQ formatting artifacts
-    try:
-        ds = load_dataset("ccdv/pubmed-summarization", "document", split="train", streaming=True)
-        for item in ds:
-            text = (item.get("abstract") or item.get("article", ""))[:max_tokens * 4]
-            if text.strip():
-                yield text, f"pubmed_abs:{count}"
-                count += 1
-                if count >= half:
-                    break
-    except Exception as e:
-        print(f"  PubMed abstracts stream error: {e}")
-
-    # pubmed_qa pqa_artificial — keep context passages (drop Q/A formatting)
-    try:
-        ds = load_dataset("pubmed_qa", "pqa_artificial", split="train",
-                          streaming=True, trust_remote_code=True)
-        for item in ds:
-            ctx_list = item.get("context", {}).get("contexts", []) if isinstance(item.get("context"), dict) else []
-            text = " ".join(ctx_list)[:max_tokens * 4]
-            if text.strip():
-                yield text, f"pubmed_qa:{count}"
-                count += 1
-                if count >= num_samples:
-                    return
-    except Exception as e:
-        print(f"  PubMedQA stream error: {e}")
 
 
 @torch.no_grad()
@@ -110,7 +80,7 @@ def collect_activations(
     chunks_dir = output_dir / "chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nCollecting activations from {hook_point}...")
-    print(f"  Dataset: medmcqa + pubmed_qa | Samples: {num_samples} | Chunk size: {chunk_size}")
+    print(f"  Dataset: medmcqa + pubmed_qa + pubmed_abs (instruction-formatted) | Samples: {num_samples}")
 
     all_activations = []
     all_token_ids = []
@@ -126,7 +96,7 @@ def collect_activations(
 
     pbar = tqdm(total=num_samples, desc="Collecting")
 
-    for text, source_id in _stream_texts(num_samples, max_tokens):
+    for text, source_id in stream_medical_texts(num_samples, max_tokens):
         batch_texts.append(text)
         batch_sources.append(source_id)
         count += 1
@@ -263,9 +233,6 @@ def train_sae(
     history = {"loss": [], "reconstruction": []}
     global_step = 0
 
-    # Track per-feature activation counts for dead feature resampling
-    feature_counts = torch.zeros(sae.d_hidden, device=device)
-
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         epoch_steps = 0
@@ -291,10 +258,6 @@ def train_sae(
                 scheduler.step()
                 sae._normalize_decoder()
 
-                # Track which features fired
-                with torch.no_grad():
-                    feature_counts += (output.hidden > 0).float().sum(dim=0)
-
                 epoch_loss += output.loss.item()
                 epoch_steps += 1
                 global_step += 1
@@ -310,27 +273,6 @@ def train_sae(
 
         print(f"  Epoch {epoch+1} avg loss: {epoch_loss / epoch_steps:.4f}")
 
-        # Dead feature resampling: reinitialize features that never fired this epoch
-        # by copying a random live feature's direction with small noise
-        with torch.no_grad():
-            dead_mask = feature_counts < 1.0
-            n_dead = dead_mask.sum().item()
-            if n_dead > 0:
-                alive_indices = (~dead_mask).nonzero(as_tuple=True)[0]
-                if len(alive_indices) > 0:
-                    sample_indices = alive_indices[torch.randint(len(alive_indices), (n_dead,), device=device)]
-                    dead_indices = dead_mask.nonzero(as_tuple=True)[0]
-                    noise_scale = sae.encoder.weight.data[sample_indices].norm(dim=1, keepdim=True) * 0.1
-                    sae.encoder.weight.data[dead_indices] = (
-                        sae.encoder.weight.data[sample_indices]
-                        + torch.randn_like(sae.encoder.weight.data[sample_indices]) * noise_scale
-                    )
-                    sae.encoder.bias.data[dead_indices] = sae.encoder.bias.data[sample_indices]
-                    sae.decoder.weight.data[:, dead_indices] = sae.decoder.weight.data[:, sample_indices]
-                    sae._normalize_decoder()
-                    print(f"  Resampled {n_dead} dead features")
-        feature_counts.zero_()  # reset counts for next epoch
-
     print(f"\nTraining complete!")
     return history
 
@@ -340,10 +282,29 @@ def train_sae(
 # =============================================================================
 
 def build_context_string(global_token_idx: int, token_ids: torch.Tensor, tokenizer, window: int = 50) -> str:
-    """Build a ±window token context string with [TOKEN] marker around the trigger token."""
+    """
+    Build a ±window token context string with [TOKEN] marker around the trigger token.
+
+    Respects document boundaries: the window is clipped at the nearest
+    <|begin_of_text|> token (ID 128000) on either side so contexts never
+    bleed across unrelated documents.
+    """
     n = len(token_ids)
+    bos_id = 128000  # <|begin_of_text|> for Llama 3.2
+
+    # Scan left for the nearest document boundary
     start = max(0, global_token_idx - window)
+    for pos in range(global_token_idx - 1, start - 1, -1):
+        if token_ids[pos].item() == bos_id:
+            start = pos + 1  # start after the BOS, not at it
+            break
+
+    # Scan right for the nearest document boundary
     end = min(n, global_token_idx + window + 1)
+    for pos in range(global_token_idx + 1, end):
+        if token_ids[pos].item() == bos_id:
+            end = pos  # stop before the next BOS
+            break
 
     parts = []
     for pos in range(start, end):
@@ -415,12 +376,17 @@ def analyze_features(
     # =========================================================================
     print("\n  Pass 2: Computing MaxAct for top features...")
 
-    bos_token_id = model.tokenizer.bos_token_id or model.tokenizer.eos_token_id
-    if bos_token_id is None:
-        bos_token_id = 50256
-    print(f"    (Excluding BOS/EOS token {bos_token_id} from MaxAct)")
+    # Exclude all Llama 3.2 structural special tokens from MaxAct.
+    # These fire based on chat-template position, not semantics.
+    special_ids_set = _LLAMA_SPECIAL_IDS.copy()
+    # Also add any additional special tokens reported by the tokenizer
+    if model.tokenizer.all_special_ids:
+        special_ids_set.update(model.tokenizer.all_special_ids)
+    print(f"    (Excluding {len(special_ids_set)} special token IDs from MaxAct)")
 
-    content_mask = token_ids != bos_token_id
+    content_mask = torch.ones(len(token_ids), dtype=torch.bool)
+    for sid in special_ids_set:
+        content_mask &= (token_ids != sid)
 
     num_features_to_analyze = sae.d_hidden
     top_feature_indices = feature_freq.topk(num_features_to_analyze).indices.tolist()
@@ -466,19 +432,40 @@ def analyze_features(
         del chunk
         gc.collect()
 
+    # Compute source-start positions: for each source index, what is the global
+    # token offset where that source begins? Used for document-relative positions.
+    source_start_positions: Dict[int, int] = {}
+    if source_ids is not None:
+        prev_sid = -1
+        for i in range(len(source_ids)):
+            sid = source_ids[i].item()
+            if sid != prev_sid:
+                source_start_positions[sid] = i
+                prev_sid = sid
+
     max_act_values = {}
     max_act_indices = {}
-    max_act_positions = {}  # (mean, std) of token position-in-sequence
+    max_act_positions = {}  # (mean, std) of token position-within-source-document
     for f_pos, feat_idx in enumerate(top_feature_indices):
         max_act_values[feat_idx] = running_vals[:, f_pos]
         max_act_indices[feat_idx] = running_idxs[:, f_pos]
-        # Position within each sequence: global_idx % max_tokens
-        # (valid since all sequences are truncated/padded to exactly max_tokens)
+
         valid_mask = running_vals[:, f_pos] > 0
         if valid_mask.any():
-            positions = (running_idxs[:, f_pos][valid_mask].float() % max_tokens)
-            pos_mean = positions.mean().item()
-            pos_std = positions.std().item() if valid_mask.sum() > 1 else 0.0
+            global_idxs = running_idxs[:, f_pos][valid_mask]
+            if source_ids is not None and source_start_positions:
+                # Position = global_idx - start_of_that_token's_source_document
+                positions = []
+                for gidx in global_idxs.tolist():
+                    sid = source_ids[gidx].item() if gidx < len(source_ids) else 0
+                    src_start = source_start_positions.get(sid, 0)
+                    positions.append(float(gidx - src_start))
+                positions_t = torch.tensor(positions)
+            else:
+                # Fallback: position within the max_tokens window (approximate)
+                positions_t = global_idxs.float() % max_tokens
+            pos_mean = positions_t.mean().item()
+            pos_std  = positions_t.std().item() if valid_mask.sum() > 1 else 0.0
         else:
             pos_mean, pos_std = 0.0, 0.0
         max_act_positions[feat_idx] = (pos_mean, pos_std)
@@ -487,13 +474,26 @@ def analyze_features(
     # Output-centric: VocabProj - Project decoder vectors onto vocabulary
     # =========================================================================
     print("  Computing VocabProj (output-centric)...")
-    unembed = model.W_U.detach()  # [d_model, vocab_size]
-    vocab_logits = decoder_weights.T @ unembed  # [d_hidden, vocab_size]
-    # Subtract per-feature mean so we see what each feature promotes ABOVE its own
-    # baseline. Without this, raw logits are dominated by common subword tokens the
-    # model predicts everywhere (e.g. 'etts', 'arted'), masking the actual signal.
-    vocab_logits = vocab_logits - vocab_logits.mean(dim=-1, keepdim=True)
-    top_vocab_values, top_vocab_indices = vocab_logits.topk(top_k, dim=-1)
+    # Compute in CPU chunks to avoid OOM: [d_hidden, vocab_size] at fp32 is ~8 GB for d_hidden=16384.
+    # Process FEAT_CHUNK features at a time instead of the full matrix at once.
+    unembed_cpu = model.W_U.detach().cpu()       # [d_model, vocab_size]
+    decoder_cpu = decoder_weights.cpu()           # [d_model, d_hidden]
+    FEAT_CHUNK = 512
+    all_top_values = []
+    all_top_indices = []
+    for chunk_start in tqdm(range(0, sae.d_hidden, FEAT_CHUNK), desc="  VocabProj (chunks)"):
+        chunk_end = min(chunk_start + FEAT_CHUNK, sae.d_hidden)
+        # [chunk_size, d_model] @ [d_model, vocab_size] → [chunk_size, vocab_size]
+        chunk_logits = decoder_cpu[:, chunk_start:chunk_end].T @ unembed_cpu
+        # Mean-subtract: removes common tokens predicted everywhere (Gao et al. 2024)
+        chunk_logits = chunk_logits - chunk_logits.mean(dim=-1, keepdim=True)
+        chunk_top_vals, chunk_top_idx = chunk_logits.topk(top_k, dim=-1)
+        all_top_values.append(chunk_top_vals)
+        all_top_indices.append(chunk_top_idx)
+        del chunk_logits
+    top_vocab_values  = torch.cat(all_top_values,  dim=0)  # [d_hidden, top_k]
+    top_vocab_indices = torch.cat(all_top_indices, dim=0)  # [d_hidden, top_k]
+    del unembed_cpu, decoder_cpu, all_top_values, all_top_indices
     
     tokenizer = model.tokenizer
     
@@ -507,9 +507,19 @@ def analyze_features(
         # Sort MaxAct results by activation value (descending)
         sorted_order = max_act_values[feat_idx].argsort(descending=True)
         
-        # Build MaxAct examples (input-centric: what tokens trigger this feature)
+        # Build MaxAct examples (input-centric: what tokens trigger this feature).
+        # Three deduplication layers:
+        #   1. Skip Llama special tokens (structural noise)
+        #   2. Skip duplicate token strings (same surface form)
+        #   3. Skip duplicate context prefixes (same document flooding multiple slots)
+        #   4. Cap examples per source document (max 2) to prevent outlier docs
+        #      from consuming all top-k slots.
         max_act_examples = []
-        seen_tokens = set()
+        seen_tokens: set = set()
+        seen_ctx_keys: set = set()
+        source_example_count: Dict[str, int] = {}
+        MAX_EXAMPLES_PER_SOURCE = 2
+
         for sort_pos in sorted_order:
             act_val = max_act_values[feat_idx][sort_pos].item()
             if act_val <= 0:
@@ -517,24 +527,45 @@ def analyze_features(
 
             token_global_idx = max_act_indices[feat_idx][sort_pos].item()
             tok_id = token_ids[token_global_idx].item()
+
+            # Skip all structural special tokens
+            if tok_id in special_ids_set:
+                continue
+
             tok_str = tokenizer.decode([tok_id])
 
-            # Deduplicate (same token can appear in multiple positions)
-            if tok_str not in seen_tokens:
-                seen_tokens.add(tok_str)
-                ctx = build_context_string(token_global_idx, token_ids, tokenizer)
-                src_id = ""
-                if source_ids is not None and source_list is not None:
-                    src_idx = source_ids[token_global_idx].item()
-                    src_id = source_list[src_idx] if src_idx < len(source_list) else ""
-                max_act_examples.append(MaxActExample(
-                    token=tok_str,
-                    token_id=tok_id,
-                    activation=act_val,
-                    context=ctx,
-                    global_token_idx=token_global_idx,
-                    source_id=src_id,
-                ))
+            # Skip duplicate token strings
+            if tok_str in seen_tokens:
+                continue
+
+            src_id = ""
+            if source_ids is not None and source_list is not None:
+                src_idx = source_ids[token_global_idx].item()
+                src_id = source_list[src_idx] if src_idx < len(source_list) else ""
+
+            # Cap per-source examples to prevent outlier documents dominating
+            if source_example_count.get(src_id, 0) >= MAX_EXAMPLES_PER_SOURCE:
+                continue
+
+            ctx = build_context_string(token_global_idx, token_ids, tokenizer)
+
+            # Skip duplicate context windows (same document section seen before)
+            ctx_key = ctx[:100]
+            if ctx_key in seen_ctx_keys:
+                continue
+
+            seen_tokens.add(tok_str)
+            seen_ctx_keys.add(ctx_key)
+            source_example_count[src_id] = source_example_count.get(src_id, 0) + 1
+
+            max_act_examples.append(MaxActExample(
+                token=tok_str,
+                token_id=tok_id,
+                activation=act_val,
+                context=ctx,
+                global_token_idx=token_global_idx,
+                source_id=src_id,
+            ))
         
         # VocabProj: tokens this feature promotes (output-centric)
         vocab_tokens = []
@@ -706,7 +737,7 @@ def main():
     print("\n" + "="*60)
     print("  Medical SAE Pipeline")
     print(f"  Model: {MODEL_NAME} | Layer: {TARGET_LAYER} | Hook: {HOOK_TYPE}")
-    print(f"  Dataset: pubmed_summarization + pubmed_qa | Output: {output_dir}")
+    print(f"  Dataset: medmcqa + pubmed_qa + pubmed_abs (chat-formatted) | Output: {output_dir}")
     print("="*60)
     if args.quick:
         print("  [QUICK TEST MODE]")
@@ -740,6 +771,17 @@ def main():
 
     # Step 3: Train SAE — loads one chunk at a time
     sae = SparseAutoencoder()
+
+    # Initialise b_pre from a sample of real activations (geometric median approx).
+    # This centres the encoder input so pre-activations start near zero — critical
+    # for fast convergence and reducing dead features (Gao et al. 2024).
+    print("\nInitialising SAE bias from data sample...")
+    _init_chunk = torch.load(chunk_files[0])
+    _init_sample = _init_chunk[:min(2048, len(_init_chunk))]
+    sae.init_bias_from_data(_init_sample)
+    del _init_chunk, _init_sample
+    print(f"  b_pre initialised (mean norm: {sae.b_pre.data.norm().item():.3f})")
+
     history = train_sae(sae, chunk_files, num_epochs=num_epochs, device=device)
 
     # Step 4: Analyze features — loads one chunk at a time
