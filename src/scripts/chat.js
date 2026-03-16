@@ -8,12 +8,10 @@ import { renderAttribution } from './attribution.js';
 
 // ── State ──────────────────────────────────────────────────────────────────────
 let history = [];     // [{role, content}]
-let sessions = [];    // [{id, title, history}]
-let currentSessionId = null;
 let isLoading = false;
 
 // ── DOM refs ───────────────────────────────────────────────────────────────────
-let messagesEl, chatForm, inputEl, sendBtn, welcomeEl, historyListEl;
+let messagesEl, chatForm, inputEl, sendBtn, welcomeEl;
 
 // ── Init ───────────────────────────────────────────────────────────────────────
 export function initChat(appState) {
@@ -22,7 +20,6 @@ export function initChat(appState) {
   inputEl      = document.getElementById('chat-input');
   sendBtn      = document.getElementById('send-btn');
   welcomeEl    = document.getElementById('welcome');
-  historyListEl= document.getElementById('history-list');
 
   // Auto-resize textarea
   inputEl.addEventListener('input', () => {
@@ -55,9 +52,6 @@ export function initChat(appState) {
     });
   });
 
-  // New chat
-  document.getElementById('new-chat-btn')?.addEventListener('click', startNewChat);
-
   // Attribution panel toggle
   const attrToggle = document.getElementById('attr-toggle');
   const chatLayout = document.querySelector('.chat-layout');
@@ -67,12 +61,6 @@ export function initChat(appState) {
     attrToggle.setAttribute('aria-pressed', String(!hidden));
   });
 
-  // Attribution view tabs
-  document.querySelectorAll('.attr-view-tab').forEach(tab => {
-    tab.addEventListener('click', () => switchAttrView(tab.dataset.view));
-  });
-
-  loadSessions();
 }
 
 // ── Send message ───────────────────────────────────────────────────────────────
@@ -116,8 +104,11 @@ async function sendMessage(message) {
     // Update history
     history.push({ role: 'assistant', content: data.response });
 
-    // Update session
-    saveSession(message, data.response);
+    // Reveal attribution panel on first response
+    const attrPanel = document.getElementById('attr-panel');
+    const attrToggle = document.getElementById('attr-toggle');
+    if (attrPanel) attrPanel.classList.remove('attr-panel-hidden');
+    if (attrToggle) attrToggle.style.visibility = '';
 
     // Render attribution
     renderAttribution({
@@ -201,95 +192,4 @@ function escapeHtml(str) {
     .replace(/\n/g, '<br>');
 }
 
-// ── Attribution view tabs ──────────────────────────────────────────────────────
-function switchAttrView(view) {
-  document.querySelectorAll('.attr-view-tab').forEach(t => {
-    t.classList.toggle('active', t.dataset.view === view);
-    t.setAttribute('aria-selected', String(t.dataset.view === view));
-  });
 
-  const graphView = document.getElementById('attr-graph-view');
-  const listView  = document.getElementById('attr-list-view');
-
-  if (view === 'graph') {
-    graphView.hidden = false;
-    listView.hidden  = true;
-  } else {
-    graphView.hidden = true;
-    listView.hidden  = false;
-  }
-}
-
-// ── Session management ─────────────────────────────────────────────────────────
-function startNewChat() {
-  history = [];
-  currentSessionId = null;
-  messagesEl.innerHTML = '';
-  if (welcomeEl) {
-    welcomeEl.style.display = '';
-    messagesEl.appendChild(welcomeEl);
-  }
-  renderAttribution({ inputFeatures: [], outputFeatures: [], responseTokens: [] });
-}
-
-function saveSession(userMsg, assistantMsg) {
-  if (!currentSessionId) {
-    currentSessionId = `session-${Date.now()}`;
-    const title = userMsg.length > 40 ? userMsg.slice(0, 40) + '…' : userMsg;
-    sessions.unshift({ id: currentSessionId, title, history: [] });
-    renderHistoryList();
-  }
-  const session = sessions.find(s => s.id === currentSessionId);
-  if (session) {
-    session.history = [...history];
-    try {
-      localStorage.setItem('sae_sessions', JSON.stringify(sessions.slice(0, 20)));
-    } catch {}
-  }
-}
-
-function loadSessions() {
-  try {
-    const stored = localStorage.getItem('sae_sessions');
-    if (stored) sessions = JSON.parse(stored);
-    renderHistoryList();
-  } catch {}
-}
-
-function renderHistoryList() {
-  if (!historyListEl) return;
-  historyListEl.innerHTML = '';
-  sessions.forEach(session => {
-    const item = document.createElement('div');
-    item.className = `history-item ${session.id === currentSessionId ? 'active' : ''}`;
-    item.setAttribute('role', 'listitem');
-    item.setAttribute('tabindex', '0');
-    item.textContent = session.title;
-    item.addEventListener('click', () => loadSession(session));
-    item.addEventListener('keydown', e => { if (e.key === 'Enter') loadSession(session); });
-    historyListEl.appendChild(item);
-  });
-}
-
-function loadSession(session) {
-  currentSessionId = session.id;
-  history = [...session.history];
-
-  messagesEl.innerHTML = '';
-
-  // Rebuild messages (skip welcome)
-  let pairs = [];
-  for (let i = 0; i < history.length; i += 2) {
-    if (history[i] && history[i + 1]) {
-      pairs.push([history[i].content, history[i + 1].content]);
-    }
-  }
-
-  pairs.forEach(([u, a]) => {
-    appendMessage('user', u);
-    appendMessage('assistant', a);
-  });
-
-  scrollToBottom();
-  renderHistoryList();
-}

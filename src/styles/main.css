@@ -293,17 +293,17 @@ a { color: var(--text-2); text-decoration: underline; text-underline-offset: 2px
 #app.sidebar-collapsed .status-indicator span { opacity: 0; }
 
 .status-dot {
-  width: 5px; height: 5px;
+  width: 7px; height: 7px;
   border-radius: 50%;
   background: var(--text-3);
   flex-shrink: 0;
-  transition: background 400ms;
+  transition: background 400ms, box-shadow 400ms;
 }
-[data-state="ok"]      .status-dot { background: var(--text-2); }
-[data-state="loading"] .status-dot { background: var(--text-2); animation: blink 1.4s ease-in-out infinite; }
-[data-state="error"]   .status-dot { background: var(--text-3); }
+[data-state="ok"]      .status-dot { background: #4ade80; box-shadow: 0 0 8px 2px #4ade8088; }
+[data-state="loading"] .status-dot { background: #fbbf24; box-shadow: 0 0 8px 2px #fbbf2488; animation: blink 1.4s ease-in-out infinite; }
+[data-state="error"]   .status-dot { background: #f87171; box-shadow: 0 0 8px 2px #f8717188; }
 
-@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.15} }
 
 /* ── Main Wrapper ────────────────────────────────────────────────────────── */
 .main-wrapper { height: 100vh; overflow: hidden; position: relative; }
@@ -337,7 +337,6 @@ a { color: var(--text-2); text-decoration: underline; text-underline-offset: 2px
   flex-direction: column;
   height: 100vh;
   min-width: 0;
-  border-right: 1px solid var(--border-1);
 }
 
 .chat-header {
@@ -547,11 +546,12 @@ a { color: var(--text-2); text-decoration: underline; text-underline-offset: 2px
   display: flex;
   flex-direction: column;
   height: 100vh;
-  background: var(--bg-0);
+  background: var(--bg-1);
   overflow: hidden;
   transition: opacity 220ms var(--ease);
 }
 .chat-layout.attr-hidden .attr-panel { opacity: 0; pointer-events: none; }
+.attr-panel.attr-panel-hidden { opacity: 0; pointer-events: none; }
 
 .attr-panel-header {
   display: flex;

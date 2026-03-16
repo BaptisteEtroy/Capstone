@@ -11,7 +11,7 @@ import { initFeatures } from './features.js';
 // ── State ──────────────────────────────────────────────────────────────────────
 export const appState = {
   currentTab: 'chat',
-  sidebarCollapsed: false,
+  sidebarCollapsed: true,
   modelReady: false,
   featuresCount: 0,
 };
@@ -40,7 +40,9 @@ export async function apiPost(path, data) {
 function initSidebar() {
   const app = document.getElementById('app');
   const toggle = document.getElementById('sidebar-toggle');
-  const history = document.getElementById('sidebar-history');
+
+  // Start collapsed
+  app.classList.add('sidebar-collapsed');
 
   toggle.addEventListener('click', () => {
     appState.sidebarCollapsed = !appState.sidebarCollapsed;
@@ -48,16 +50,6 @@ function initSidebar() {
     toggle.setAttribute('aria-expanded', String(!appState.sidebarCollapsed));
     toggle.setAttribute('aria-label', appState.sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar');
   });
-
-  // Only show history in chat tab
-  updateHistoryVisibility();
-}
-
-function updateHistoryVisibility() {
-  const history = document.getElementById('sidebar-history');
-  if (history) {
-    history.style.display = appState.currentTab === 'chat' ? 'flex' : 'none';
-  }
 }
 
 // ── Tabs ───────────────────────────────────────────────────────────────────────
@@ -91,8 +83,6 @@ function switchTab(tab, navItems, panels) {
     panel.hidden = !isActive;
   });
 
-  updateHistoryVisibility();
-
   // Notify modules that a tab became active
   window.dispatchEvent(new CustomEvent('sae:tab', { detail: { tab } }));
 }
@@ -100,7 +90,6 @@ function switchTab(tab, navItems, panels) {
 // ── Status ─────────────────────────────────────────────────────────────────────
 async function pollStatus() {
   const indicator = document.getElementById('status-indicator');
-  const statusText = document.getElementById('status-text');
   const modelChip = document.getElementById('model-chip');
   const featTotal = document.getElementById('features-total');
 
@@ -111,16 +100,13 @@ async function pollStatus() {
 
     if (health.error) {
       indicator.dataset.state = 'error';
-      statusText.textContent = 'Error';
     } else if (health.model_loaded) {
       indicator.dataset.state = 'ok';
-      statusText.textContent = 'Ready';
       if (modelChip) {
         modelChip.textContent = `Llama 3.2 1B · SAE L8 · ${health.features_count} features`;
       }
     } else {
       indicator.dataset.state = 'loading';
-      statusText.textContent = 'Loading model…';
     }
 
     if (featTotal && health.features_count) {
@@ -128,7 +114,6 @@ async function pollStatus() {
     }
   } catch {
     indicator.dataset.state = 'error';
-    statusText.textContent = 'Offline';
   }
 }
 

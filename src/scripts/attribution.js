@@ -20,20 +20,11 @@ const PATH_COLOR   = '#888896';   // text-2
 
 // ── Public API ─────────────────────────────────────────────────────────────────
 export function renderAttribution({ inputFeatures, outputFeatures, responseTokens }) {
-  const emptyEl    = document.getElementById('attr-empty');
-  const graphView  = document.getElementById('attr-graph-view');
-  const listView   = document.getElementById('attr-list-view');
-
+  const graphView = document.getElementById('attr-graph-view');
   const hasData = inputFeatures.length > 0 || outputFeatures.length > 0;
-
-  if (emptyEl)   emptyEl.style.display   = hasData ? 'none' : '';
-  if (graphView) graphView.hidden         = !hasData;
-  if (listView)  listView.hidden          = !hasData;
-
+  if (graphView) graphView.hidden = !hasData;
   if (!hasData) return;
-
   renderGraph({ inputFeatures, outputFeatures, responseTokens });
-  renderList({ inputFeatures, outputFeatures });
 }
 
 // ── Graph view ─────────────────────────────────────────────────────────────────
