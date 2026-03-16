@@ -1,34 +1,31 @@
 /**
  * chat.js — Chat panel logic
- * Handles message submission, display, conversation history, and wires up attribution.
+ * Handles message submission, display, conversation history, and inline attribution.
  */
 
-import { apiPost } from './app.js';
-import { renderAttribution } from './attribution.js';
+import { renderInlineAttribution } from './attribution.js';
 
 // ── State ──────────────────────────────────────────────────────────────────────
-let history = [];     // [{role, content}]
+let history = [];
 let isLoading = false;
 
 // ── DOM refs ───────────────────────────────────────────────────────────────────
 let messagesEl, chatForm, inputEl, sendBtn, welcomeEl;
 
 // ── Init ───────────────────────────────────────────────────────────────────────
-export function initChat(appState) {
-  messagesEl   = document.getElementById('messages');
-  chatForm     = document.getElementById('chat-form');
-  inputEl      = document.getElementById('chat-input');
-  sendBtn      = document.getElementById('send-btn');
-  welcomeEl    = document.getElementById('welcome');
+export function initChat(_appState) {
+  messagesEl = document.getElementById('messages');
+  chatForm   = document.getElementById('chat-form');
+  inputEl    = document.getElementById('chat-input');
+  sendBtn    = document.getElementById('send-btn');
+  welcomeEl  = document.getElementById('welcome');
 
-  // Auto-resize textarea
   inputEl.addEventListener('input', () => {
     inputEl.style.height = 'auto';
     inputEl.style.height = `${Math.min(inputEl.scrollHeight, 160)}px`;
     sendBtn.disabled = !inputEl.value.trim();
   });
 
-  // Submit on Enter (Shift+Enter = newline)
   inputEl.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -43,24 +40,13 @@ export function initChat(appState) {
     sendMessage(message);
   });
 
-  // Example chips
   document.querySelectorAll('.example-chip').forEach(chip => {
     chip.addEventListener('click', () => {
       inputEl.value = chip.dataset.prompt;
       inputEl.dispatchEvent(new Event('input'));
-      inputEl.focus();
+      chatForm.requestSubmit();
     });
   });
-
-  // Attribution panel toggle
-  const attrToggle = document.getElementById('attr-toggle');
-  const chatLayout = document.querySelector('.chat-layout');
-  attrToggle?.addEventListener('click', () => {
-    const hidden = chatLayout.classList.toggle('attr-hidden');
-    attrToggle.classList.toggle('active', !hidden);
-    attrToggle.setAttribute('aria-pressed', String(!hidden));
-  });
-
 }
 
 // ── Send message ───────────────────────────────────────────────────────────────
@@ -68,59 +54,90 @@ async function sendMessage(message) {
   if (isLoading) return;
   isLoading = true;
 
-  // Hide welcome
   if (welcomeEl) welcomeEl.style.display = 'none';
 
-  // Clear input
   inputEl.value = '';
   inputEl.style.height = 'auto';
   sendBtn.disabled = true;
   sendBtn.classList.add('loading');
 
-  // Append user message
   appendMessage('user', message);
-
-  // Scroll to bottom
   scrollToBottom();
 
-  // Append thinking indicator
   const thinkingId = appendThinking();
-
-  // Push to history
   history.push({ role: 'user', content: message });
 
+  let msgEl = null;
+  let responseText = '';
+
   try {
-    const data = await apiPost('/api/chat', {
-      message,
-      history: history.slice(-6), // last 6 turns
+    const res = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, history: history.slice(-6) }),
     });
 
-    // Remove thinking
-    removeThinking(thinkingId);
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || `HTTP ${res.status}`);
+    }
 
-    // Append assistant response
-    appendMessage('assistant', data.response);
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
 
-    // Update history
-    history.push({ role: 'assistant', content: data.response });
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
 
-    // Reveal attribution panel on first response
-    const attrPanel = document.getElementById('attr-panel');
-    const attrToggle = document.getElementById('attr-toggle');
-    if (attrPanel) attrPanel.classList.remove('attr-panel-hidden');
-    if (attrToggle) attrToggle.style.visibility = '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let evt;
+        try { evt = JSON.parse(line.slice(6)); } catch { continue; }
 
-    // Render attribution
-    renderAttribution({
-      inputFeatures: data.input_features || [],
-      outputFeatures: data.output_features || [],
-      responseTokens: data.response_tokens || [],
-    });
+        if (evt.type === 'log') {
+          // Only show log stages while thinking (before tokens arrive)
+          if (!msgEl) updateThinkingStage(thinkingId, evt.text);
+
+        } else if (evt.type === 'token') {
+          if (!msgEl) {
+            removeThinking(thinkingId);
+            msgEl = appendMessage('assistant', '');
+          }
+          responseText += evt.text;
+          updateMessageText(msgEl, responseText);
+
+        } else if (evt.type === 'result') {
+          // Fallback: if no tokens streamed, render full response now
+          if (!msgEl) {
+            removeThinking(thinkingId);
+            msgEl = appendMessage('assistant', evt.response || '');
+            responseText = evt.response || '';
+          }
+          history.push({ role: 'assistant', content: responseText });
+          if ((evt.input_features?.length || evt.output_features?.length) && msgEl) {
+            renderInlineAttribution(msgEl, {
+              inputFeatures: evt.input_features || [],
+              outputFeatures: evt.output_features || [],
+            });
+          }
+
+        } else if (evt.type === 'error') {
+          removeThinking(thinkingId);
+          appendError(evt.text || 'Generation failed');
+          history.pop();
+        }
+      }
+      scrollToBottom();
+    }
 
   } catch (err) {
     removeThinking(thinkingId);
-    appendError(err.message || 'Request failed. Is the model loaded?');
-    history.pop(); // remove failed user message from history
+    if (!msgEl) appendError(err.message || 'Request failed. Is the model loaded?');
+    history.pop();
   } finally {
     isLoading = false;
     sendBtn.classList.remove('loading');
@@ -135,13 +152,30 @@ function appendMessage(role, content) {
   el.className = `message ${role}`;
   el.setAttribute('role', 'listitem');
 
-  el.innerHTML = `
-    <div class="message-role ${role}-role">${role === 'user' ? 'You' : 'Assistant'}</div>
-    <div class="message-body">${escapeHtml(content)}</div>
-  `;
+  if (role === 'assistant') {
+    el.innerHTML = `
+      <div class="message-role assistant-role">Assistant</div>
+      <div class="message-inner">
+        <div class="message-main">
+          <div class="message-body">${escapeHtml(content)}</div>
+        </div>
+        <div class="message-attr" id="msg-attr-${Date.now()}"></div>
+      </div>
+    `;
+  } else {
+    el.innerHTML = `
+      <div class="message-role user-role">You</div>
+      <div class="message-body">${escapeHtml(content)}</div>
+    `;
+  }
 
   messagesEl.appendChild(el);
   return el;
+}
+
+function updateMessageText(msgEl, text) {
+  const body = msgEl.querySelector('.message-body');
+  if (body) body.innerHTML = escapeHtml(text);
 }
 
 function appendThinking() {
@@ -151,16 +185,28 @@ function appendThinking() {
   el.id = id;
   el.innerHTML = `
     <div class="message-role assistant-role">Assistant</div>
-    <div class="thinking">
-      <div class="thinking-dots">
-        <span></span><span></span><span></span>
+    <div class="message-inner">
+      <div class="message-main">
+        <div class="thinking-stages" id="${id}-stages"></div>
       </div>
-      <span class="thinking-label">Thinking…</span>
     </div>
   `;
   messagesEl.appendChild(el);
   scrollToBottom();
   return id;
+}
+
+function updateThinkingStage(id, text) {
+  const stagesEl = document.getElementById(`${id}-stages`);
+  if (!stagesEl) return;
+  const prev = stagesEl.querySelector('.thinking-stage:last-child');
+  if (prev) prev.classList.add('done');
+  const stage = document.createElement('div');
+  stage.className = 'thinking-stage';
+  stage.innerHTML = `<span class="thinking-stage-dot"></span><span class="thinking-stage-label">${text}</span>`;
+  stagesEl.appendChild(stage);
+  requestAnimationFrame(() => requestAnimationFrame(() => stage.classList.add('visible')));
+  scrollToBottom();
 }
 
 function removeThinking(id) {
@@ -191,5 +237,3 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;')
     .replace(/\n/g, '<br>');
 }
-
-
