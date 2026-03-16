@@ -59,7 +59,6 @@ async function sendMessage(message) {
   inputEl.value = '';
   inputEl.style.height = 'auto';
   sendBtn.disabled = true;
-  sendBtn.classList.add('loading');
 
   appendMessage('user', message);
   scrollToBottom();
@@ -140,7 +139,6 @@ async function sendMessage(message) {
     history.pop();
   } finally {
     isLoading = false;
-    sendBtn.classList.remove('loading');
     sendBtn.disabled = !inputEl.value.trim();
     scrollToBottom();
   }
@@ -159,7 +157,7 @@ function appendMessage(role, content) {
         <div class="message-main">
           <div class="message-body">${escapeHtml(content)}</div>
         </div>
-        <div class="message-attr" id="msg-attr-${Date.now()}"></div>
+        <div class="message-attr"></div>
       </div>
     `;
   } else {

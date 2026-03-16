@@ -85,11 +85,3 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;');
 }
 
-// ── Legacy graph renderer (used by explore.js if needed) ──────────────────────
-const NODE_COLOR = '#32323a';
-const NODE_STROKE = '#3e3e48';
-const PATH_COLOR  = '#888896';
-
-export function renderAttribution({ inputFeatures, outputFeatures, responseTokens }) {
-  // No-op: attribution is now rendered inline per-message via renderInlineAttribution
-}

@@ -12,7 +12,7 @@ import json
 import torch
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -189,8 +189,9 @@ def _top_features(hidden: torch.Tensor, top_k: int = 8, threshold: float = 0.3) 
             break
         if len(results) >= top_k:
             break
-        label, conf = _get_feature_label(idx)
         fdata = srv.feature_by_index.get(idx, {})
+        label = fdata.get("label", f"Feature {idx}")
+        conf = fdata.get("confidence", "unknown")
         max_act_list = fdata.get("max_activating_tokens", [])
         evidence = [
             e["token"] for e in max_act_list[:4]
@@ -210,7 +211,7 @@ def _top_features(hidden: torch.Tensor, top_k: int = 8, threshold: float = 0.3) 
 
 def _build_prompt(message: str, history: List[Dict[str, str]]) -> str:
     prompt = ""
-    for turn in (history or [])[-3:]:
+    for turn in (history or []):
         role = turn.get("role", "user")
         content = turn.get("content", "")
         if role == "user":
@@ -233,61 +234,6 @@ async def health():
         "error": srv.error,
     }
 
-
-@app.post("/api/chat")
-async def chat(req: ChatRequest):
-    srv.load()
-    if srv.error and not srv.loaded:
-        raise HTTPException(status_code=503, detail=srv.error)
-
-    try:
-        prompt = _build_prompt(req.message, req.history)
-
-        # 1. Input attribution — what did the user message activate?
-        input_hidden, _, _ = _encode_text(req.message)
-        input_features = _top_features(input_hidden, top_k=8)
-
-        # 2. Generate response
-        tokens = srv.model.to_tokens(prompt)
-        with torch.no_grad():
-            generated = srv.model.generate(
-                tokens,
-                max_new_tokens=150,
-                temperature=0.7,
-                top_p=0.9,
-                stop_at_eos=True,
-            )
-        response_ids = generated[0, tokens.shape[1]:]
-        response = srv.model.tokenizer.decode(response_ids.tolist())
-
-        # 3. Output attribution — what shaped the response?
-        hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
-        with torch.no_grad():
-            _, cache = srv.model.run_with_cache(generated)
-            activations = cache[hook_point][0]
-            gen_acts = activations[tokens.shape[1]:]
-            if gen_acts.shape[0] == 0:
-                gen_acts = activations
-            output_hidden = srv.sae.encode(gen_acts.to(srv.device))
-
-        output_features = _top_features(output_hidden, top_k=8)
-
-        # 4. Response tokens (for display)
-        resp_tokens = [
-            srv.model.tokenizer.decode([t])
-            for t in generated[0, tokens.shape[1]:].tolist()
-        ]
-        resp_tokens = [t for t in resp_tokens if t.strip() and t.strip() not in _SPECIAL_TOKENS]
-
-        return {
-            "response": response,
-            "response_tokens": resp_tokens[-12:],
-            "input_features": input_features,
-            "output_features": output_features,
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/chat/stream")
@@ -325,7 +271,7 @@ async def chat_stream(req: ChatRequest):
             with torch.no_grad():
                 generated = srv.model.generate(
                     tokens,
-                    max_new_tokens=300,
+                    max_new_tokens=200,
                     temperature=0.7,
                     top_p=0.9,
                     stop_at_eos=True,
@@ -354,13 +300,9 @@ async def chat_stream(req: ChatRequest):
                 output_hidden = srv.sae.encode(gen_acts.to(srv.device))
             output_features = _top_features(output_hidden, top_k=8)
 
-            resp_tokens = [srv.model.tokenizer.decode([t]) for t in response_ids.tolist()]
-            resp_tokens = [t for t in resp_tokens if t.strip() and t.strip() not in _SPECIAL_TOKENS]
-
             _put({
                 "type": "result",
                 "response": response,
-                "response_tokens": resp_tokens[-12:],
                 "input_features": input_features,
                 "output_features": output_features,
             })
