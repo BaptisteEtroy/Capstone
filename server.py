@@ -7,16 +7,17 @@ Replaces the Gradio interface with a clean REST API + static HTML/JS/CSS fronten
 import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
+import asyncio
 import json
 import torch
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -119,6 +120,22 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan, title="SAE Lab API")
 
 
+# Disable caching for all static assets so frontend changes are always picked up
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+
+class NoCacheMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith(("/styles/", "/scripts/")):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+
+app.add_middleware(NoCacheMiddleware)
+
+
 # =============================================================================
 # Pydantic models
 # =============================================================================
@@ -172,8 +189,9 @@ def _top_features(hidden: torch.Tensor, top_k: int = 8, threshold: float = 0.3) 
             break
         if len(results) >= top_k:
             break
-        label, conf = _get_feature_label(idx)
         fdata = srv.feature_by_index.get(idx, {})
+        label = fdata.get("label", f"Feature {idx}")
+        conf = fdata.get("confidence", "unknown")
         max_act_list = fdata.get("max_activating_tokens", [])
         evidence = [
             e["token"] for e in max_act_list[:4]
@@ -193,7 +211,7 @@ def _top_features(hidden: torch.Tensor, top_k: int = 8, threshold: float = 0.3) 
 
 def _build_prompt(message: str, history: List[Dict[str, str]]) -> str:
     prompt = ""
-    for turn in (history or [])[-3:]:
+    for turn in (history or []):
         role = turn.get("role", "user")
         content = turn.get("content", "")
         if role == "user":
@@ -217,60 +235,96 @@ async def health():
     }
 
 
-@app.post("/api/chat")
-async def chat(req: ChatRequest):
-    srv.load()
-    if srv.error and not srv.loaded:
-        raise HTTPException(status_code=503, detail=srv.error)
 
-    try:
-        prompt = _build_prompt(req.message, req.history)
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest):
+    # NOTE: do NOT call srv.load() here — it blocks the event loop.
+    # Loading happens inside the executor thread so SSE events can flow immediately.
 
-        # 1. Input attribution — what did the user message activate?
-        input_hidden, _, _ = _encode_text(req.message)
-        input_features = _top_features(input_hidden, top_k=8)
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
 
-        # 2. Generate response
-        tokens = srv.model.to_tokens(prompt)
-        with torch.no_grad():
-            generated = srv.model.generate(
-                tokens,
-                max_new_tokens=150,
-                temperature=0.7,
-                top_p=0.9,
-                stop_at_eos=True,
-            )
-        response_ids = generated[0, tokens.shape[1]:]
-        response = srv.model.tokenizer.decode(response_ids.tolist())
+    def _put(obj: dict):
+        loop.call_soon_threadsafe(queue.put_nowait, json.dumps(obj))
 
-        # 3. Output attribution — what shaped the response?
-        hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
-        with torch.no_grad():
-            _, cache = srv.model.run_with_cache(generated)
-            activations = cache[hook_point][0]
-            gen_acts = activations[tokens.shape[1]:]
-            if gen_acts.shape[0] == 0:
-                gen_acts = activations
-            output_hidden = srv.sae.encode(gen_acts.to(srv.device))
+    def run():
+        try:
+            # ── 1. Load model (only blocks on first ever request) ────────────
+            if not srv.loaded:
+                _put({"type": "log", "text": "Loading model…"})
+                srv.load()
+                if srv.error and not srv.loaded:
+                    _put({"type": "error", "text": srv.error or "Failed to load model"})
+                    return
 
-        output_features = _top_features(output_hidden, top_k=8)
+            # ── 2. Input attribution ─────────────────────────────────────────
+            _put({"type": "log", "text": "Tokenizing input"})
+            prompt = _build_prompt(req.message, req.history)
 
-        # 4. Response tokens (for display)
-        resp_tokens = [
-            srv.model.tokenizer.decode([t])
-            for t in generated[0, tokens.shape[1]:].tolist()
-        ]
-        resp_tokens = [t for t in resp_tokens if t.strip() and t.strip() not in _SPECIAL_TOKENS]
+            _put({"type": "log", "text": "Input attribution · SAE encode"})
+            input_hidden, _, _ = _encode_text(req.message)
+            input_features = _top_features(input_hidden, top_k=8)
 
-        return {
-            "response": response,
-            "response_tokens": resp_tokens[-12:],
-            "input_features": input_features,
-            "output_features": output_features,
-        }
+            # ── 3. Generate (uses KV cache — fast) ───────────────────────────
+            _put({"type": "log", "text": "Generating response"})
+            tokens = srv.model.to_tokens(prompt)
+            with torch.no_grad():
+                generated = srv.model.generate(
+                    tokens,
+                    max_new_tokens=200,
+                    temperature=0.7,
+                    top_p=0.9,
+                    stop_at_eos=True,
+                    verbose=False,
+                )
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            # Stream response tokens to the client
+            response_ids = generated[0, tokens.shape[1]:]
+            for token_id in response_ids.tolist():
+                tok_str = srv.model.tokenizer.decode([token_id])
+                if tok_str.strip() and tok_str.strip() not in _SPECIAL_TOKENS:
+                    _put({"type": "token", "text": tok_str})
+
+            response = srv.model.tokenizer.decode(response_ids.tolist())
+
+            # ── 4. Output attribution ────────────────────────────────────────
+            _put({"type": "log", "text": "Output attribution · SAE encode"})
+            hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
+            prompt_len = tokens.shape[1]
+            with torch.no_grad():
+                _, cache = srv.model.run_with_cache(generated)
+                activations = cache[hook_point][0]
+                gen_acts = activations[prompt_len:]
+                if gen_acts.shape[0] == 0:
+                    gen_acts = activations
+                output_hidden = srv.sae.encode(gen_acts.to(srv.device))
+            output_features = _top_features(output_hidden, top_k=8)
+
+            _put({
+                "type": "result",
+                "response": response,
+                "input_features": input_features,
+                "output_features": output_features,
+            })
+        except Exception as e:
+            _put({"type": "error", "text": str(e)})
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    loop.run_in_executor(None, run)
+
+    async def event_stream():
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield f"data: {item}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 @app.post("/api/steer")
@@ -497,9 +551,16 @@ app.mount("/styles", StaticFiles(directory=str(SRC_DIR / "styles")), name="style
 app.mount("/scripts", StaticFiles(directory=str(SRC_DIR / "scripts")), name="scripts")
 
 
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+
 @app.get("/")
 async def index():
-    return FileResponse(str(SRC_DIR / "index.html"))
+    return FileResponse(str(SRC_DIR / "index.html"), headers=NO_CACHE_HEADERS)
 
 
 @app.get("/{path:path}")

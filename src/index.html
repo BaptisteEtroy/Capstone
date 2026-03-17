@@ -28,143 +28,94 @@
 <div id="app">
 
   <!-- ═══════════════════════════════════════════════════════════════════
-       SIDEBAR
+       FLOATING NAV HUB (top-left)
   ════════════════════════════════════════════════════════════════════════ -->
-  <aside id="sidebar" class="sidebar" aria-label="Application navigation">
+  <div id="nav-hub" class="nav-hub" role="navigation" aria-label="Main navigation">
+    <div class="hub-anchor">
 
-    <div class="sidebar-top">
-      <div class="logo">
-        <div class="logo-mark" aria-hidden="true">
-          <svg viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <rect x="1" y="1" width="20" height="20" rx="3" stroke="currentColor" stroke-width="1" opacity=".25"/>
-            <circle cx="11" cy="11" r="2" fill="currentColor" opacity=".7"/>
-            <circle cx="5"  cy="5"  r="1.2" fill="currentColor" opacity=".35"/>
-            <circle cx="17" cy="5"  r="1.2" fill="currentColor" opacity=".35"/>
-            <circle cx="5"  cy="17" r="1.2" fill="currentColor" opacity=".35"/>
-            <circle cx="17" cy="17" r="1.2" fill="currentColor" opacity=".35"/>
-            <line x1="6.2" y1="6.2" x2="9.4" y2="9.4" stroke="currentColor" stroke-width=".6" opacity=".25"/>
-            <line x1="15.8" y1="6.2" x2="12.6" y2="9.4" stroke="currentColor" stroke-width=".6" opacity=".25"/>
-            <line x1="6.2" y1="15.8" x2="9.4" y2="12.6" stroke="currentColor" stroke-width=".6" opacity=".25"/>
-            <line x1="15.8" y1="15.8" x2="12.6" y2="12.6" stroke="currentColor" stroke-width=".6" opacity=".25"/>
-          </svg>
-        </div>
-        <span class="logo-text">SAE Lab</span>
-      </div>
-      <button
-        id="sidebar-toggle"
-        class="sidebar-toggle"
-        aria-label="Collapse sidebar"
-        aria-expanded="true"
-        aria-controls="sidebar"
-      >
+      <!-- Hamburger trigger -->
+      <button class="hub-btn" id="menu-btn" aria-label="Open navigation" aria-expanded="false">
         <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
-          <path d="M13 5L8 10L13 15"/>
+          <line x1="3" y1="6"  x2="17" y2="6"/>
+          <line x1="3" y1="10" x2="17" y2="10"/>
+          <line x1="3" y1="14" x2="17" y2="14"/>
         </svg>
       </button>
-    </div>
 
-    <!-- Nav tabs -->
-    <nav class="sidebar-nav" role="tablist" aria-label="Main navigation">
+      <!-- Status dot — always visible, positioned right of menu btn -->
+      <div class="hub-status" id="status-indicator" data-state="loading" aria-live="polite" aria-label="Model status">
+        <div class="s-dot" aria-hidden="true"></div>
+      </div>
 
-      <button
-        class="nav-item active"
-        role="tab"
-        data-tab="chat"
-        aria-selected="true"
-        aria-controls="panel-chat"
-        id="tab-chat"
-        title="Chat"
-      >
-        <span class="nav-icon" aria-hidden="true">
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5">
+      <!-- Nav items — visible on hover -->
+      <div class="hub-nav" role="tablist" aria-label="Switch section">
+
+        <button
+          class="hub-nav-btn active"
+          role="tab"
+          data-tab="chat"
+          aria-selected="true"
+          aria-controls="panel-chat"
+          id="tab-chat"
+          title="Chat"
+        >
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
             <path d="M17.5 13.5A2 2 0 0 1 15.5 15.5H6L2.5 19V4.5A2 2 0 0 1 4.5 2.5H15.5A2 2 0 0 1 17.5 4.5Z"/>
           </svg>
-        </span>
-        <span class="nav-label">Chat</span>
-      </button>
+        </button>
 
-      <button
-        class="nav-item"
-        role="tab"
-        data-tab="steer"
-        aria-selected="false"
-        aria-controls="panel-steer"
-        id="tab-steer"
-        title="Feature Steering"
-      >
-        <span class="nav-icon" aria-hidden="true">
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5">
+        <button
+          class="hub-nav-btn"
+          role="tab"
+          data-tab="steer"
+          aria-selected="false"
+          aria-controls="panel-steer"
+          id="tab-steer"
+          title="Steer"
+        >
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
             <circle cx="10" cy="10" r="2.5"/>
             <path d="M16.2 3.8A9 9 0 0 1 16.2 16.2"/>
             <path d="M3.8 3.8A9 9 0 0 0 3.8 16.2"/>
             <path d="M13.5 6.5A5 5 0 0 1 13.5 13.5"/>
             <path d="M6.5 6.5A5 5 0 0 0 6.5 13.5"/>
           </svg>
-        </span>
-        <span class="nav-label">Steer</span>
-      </button>
+        </button>
 
-      <button
-        class="nav-item"
-        role="tab"
-        data-tab="explore"
-        aria-selected="false"
-        aria-controls="panel-explore"
-        id="tab-explore"
-        title="Circuit Explorer"
-      >
-        <span class="nav-icon" aria-hidden="true">
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5">
+        <button
+          class="hub-nav-btn"
+          role="tab"
+          data-tab="explore"
+          aria-selected="false"
+          aria-controls="panel-explore"
+          id="tab-explore"
+          title="Explore"
+        >
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
             <polygon points="10 2 12.9 7.3 18.8 8.2 14.4 12.5 15.4 18.4 10 15.5 4.6 18.4 5.6 12.5 1.2 8.2 7.1 7.3"/>
           </svg>
-        </span>
-        <span class="nav-label">Explore</span>
-      </button>
+        </button>
 
-      <button
-        class="nav-item"
-        role="tab"
-        data-tab="features"
-        aria-selected="false"
-        aria-controls="panel-features"
-        id="tab-features"
-        title="Feature Browser"
-      >
-        <span class="nav-icon" aria-hidden="true">
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5">
+        <button
+          class="hub-nav-btn"
+          role="tab"
+          data-tab="features"
+          aria-selected="false"
+          aria-controls="panel-features"
+          id="tab-features"
+          title="Features"
+        >
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
             <rect x="2" y="2" width="7" height="7" rx=".5"/>
             <rect x="11" y="2" width="7" height="7" rx=".5"/>
             <rect x="2" y="11" width="7" height="7" rx=".5"/>
             <rect x="11" y="11" width="7" height="7" rx=".5"/>
           </svg>
-        </span>
-        <span class="nav-label">Features</span>
-      </button>
+        </button>
 
-    </nav>
-
-    <!-- Chat history (visible in Chat tab) -->
-    <div class="sidebar-history" id="sidebar-history" aria-label="Conversation history">
-      <div class="history-label">History</div>
-      <div id="history-list" class="history-list" role="list"></div>
-      <button class="new-chat-btn" id="new-chat-btn" aria-label="Start new conversation">
-        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
-          <line x1="10" y1="4" x2="10" y2="16"/>
-          <line x1="4" y1="10" x2="16" y2="10"/>
-        </svg>
-        New chat
-      </button>
-    </div>
-
-    <!-- Status bar -->
-    <div class="sidebar-status" id="sidebar-status">
-      <div class="status-indicator" id="status-indicator" data-state="loading" aria-live="polite">
-        <div class="status-dot" aria-hidden="true"></div>
-        <span id="status-text">Connecting…</span>
       </div>
     </div>
-
-  </aside>
+  </div>
 
   <!-- ═══════════════════════════════════════════════════════════════════
        MAIN CONTENT
@@ -178,140 +129,51 @@
       role="tabpanel"
       aria-labelledby="tab-chat"
     >
-      <div class="chat-layout" id="chat-layout">
+      <div class="chat-col" id="chat-col">
 
-        <!-- Chat column -->
-        <div class="chat-col" id="chat-col">
-
-          <header class="chat-header">
-            <div class="chat-header-left">
-              <h1 class="chat-heading">Chat</h1>
-              <span class="model-chip" id="model-chip">
-                Llama 3.2 1B · SAE L8
-              </span>
+        <div id="messages" class="messages" role="log" aria-label="Conversation" aria-live="polite">
+          <!-- Welcome state -->
+          <div class="welcome" id="welcome">
+            <h2 class="welcome-title">SAE Interpretability Lab</h2>
+            <p class="welcome-sub">Ask a question and observe which sparse autoencoder features activate — tracing how the model maps inputs to outputs through learned representations.</p>
+            <div class="example-chips" role="list" aria-label="Example prompts">
+              <button class="example-chip" role="listitem" data-prompt="What are the main symptoms of myocardial infarction?">Myocardial infarction</button>
+              <button class="example-chip" role="listitem" data-prompt="How do beta-blockers lower blood pressure?">Beta-blocker mechanism</button>
+              <button class="example-chip" role="listitem" data-prompt="What is the difference between type 1 and type 2 diabetes?">Type 1 vs Type 2 diabetes</button>
+              <button class="example-chip" role="listitem" data-prompt="Explain the blood-brain barrier.">Blood-brain barrier</button>
             </div>
-            <div class="chat-header-right">
+          </div>
+        </div>
+
+        <div class="chat-input-wrap">
+          <form id="chat-form" class="chat-form" novalidate>
+            <div class="input-shell">
+              <textarea
+                id="chat-input"
+                class="chat-input"
+                placeholder="Ask a medical question…"
+                rows="1"
+                aria-label="Message"
+                aria-required="true"
+                autocomplete="off"
+                spellcheck="true"
+              ></textarea>
               <button
-                class="icon-btn active"
-                id="attr-toggle"
-                aria-pressed="true"
-                aria-label="Toggle attribution panel"
-                title="Attribution panel"
+                type="submit"
+                id="send-btn"
+                class="send-btn"
+                aria-label="Send message"
+                disabled
               >
-                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
-                  <circle cx="6" cy="10" r="2"/>
-                  <circle cx="14" cy="5" r="2"/>
-                  <circle cx="14" cy="15" r="2"/>
-                  <line x1="8" y1="10" x2="12" y2="6"/>
-                  <line x1="8" y1="10" x2="12" y2="14"/>
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <line x1="18" y1="2" x2="9" y2="11"/>
+                  <polygon points="18 2 12 18 9 11 2 8"/>
                 </svg>
               </button>
             </div>
-          </header>
-
-          <div id="messages" class="messages" role="log" aria-label="Conversation" aria-live="polite">
-            <!-- Welcome state -->
-            <div class="welcome" id="welcome">
-              <h2 class="welcome-title">SAE Interpretability Lab</h2>
-              <p class="welcome-sub">Ask a question and observe which sparse autoencoder features activate — tracing how the model maps inputs to outputs through learned representations.</p>
-              <div class="example-chips" role="list" aria-label="Example prompts">
-                <button class="example-chip" role="listitem" data-prompt="What are the main symptoms of myocardial infarction?">Myocardial infarction</button>
-                <button class="example-chip" role="listitem" data-prompt="How do beta-blockers lower blood pressure?">Beta-blocker mechanism</button>
-                <button class="example-chip" role="listitem" data-prompt="What is the difference between type 1 and type 2 diabetes?">Type 1 vs Type 2 diabetes</button>
-                <button class="example-chip" role="listitem" data-prompt="Explain the blood-brain barrier.">Blood-brain barrier</button>
-              </div>
-            </div>
-          </div>
-
-          <div class="chat-input-wrap">
-            <form id="chat-form" class="chat-form" novalidate>
-              <div class="input-shell">
-                <textarea
-                  id="chat-input"
-                  class="chat-input"
-                  placeholder="Ask a medical question…"
-                  rows="1"
-                  aria-label="Message"
-                  aria-required="true"
-                  autocomplete="off"
-                  spellcheck="true"
-                ></textarea>
-                <button
-                  type="submit"
-                  id="send-btn"
-                  class="send-btn"
-                  aria-label="Send message"
-                  disabled
-                >
-                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                    <line x1="18" y1="2" x2="9" y2="11"/>
-                    <polygon points="18 2 12 18 9 11 2 8"/>
-                  </svg>
-                </button>
-              </div>
-            </form>
-            <p class="input-hint">Medical domain · Llama 3.2 1B-Instruct · SAE Layer 8 · TopK-64</p>
-          </div>
-
+          </form>
+          <p class="input-hint">Medical domain · Llama 3.2 1B-Instruct · SAE Layer 8 · TopK-64</p>
         </div>
-
-        <!-- Attribution panel -->
-        <aside
-          id="attr-panel"
-          class="attr-panel"
-          aria-label="Feature attribution"
-          aria-live="polite"
-        >
-          <div class="attr-panel-header">
-            <h2 class="attr-title">Attribution</h2>
-            <div class="attr-view-tabs" role="tablist" aria-label="Attribution view">
-              <button class="attr-view-tab active" data-view="graph" role="tab" aria-selected="true">Graph</button>
-              <button class="attr-view-tab" data-view="list" role="tab" aria-selected="false">List</button>
-            </div>
-          </div>
-
-          <!-- Empty state -->
-          <div class="attr-empty" id="attr-empty" aria-label="No attribution data">
-            <div class="attr-empty-icon" aria-hidden="true">
-              <svg viewBox="0 0 56 56" fill="none">
-                <circle cx="28" cy="28" r="5" fill="var(--border-default)" opacity=".6"/>
-                <circle cx="10" cy="14" r="3.5" fill="var(--border-default)" opacity=".4"/>
-                <circle cx="46" cy="14" r="3.5" fill="var(--border-default)" opacity=".4"/>
-                <circle cx="10" cy="42" r="3.5" fill="var(--border-default)" opacity=".4"/>
-                <circle cx="46" cy="42" r="3.5" fill="var(--border-default)" opacity=".4"/>
-                <line x1="13" y1="15" x2="24" y2="24" stroke="var(--border-default)" stroke-width="1" opacity=".3"/>
-                <line x1="43" y1="15" x2="32" y2="24" stroke="var(--border-default)" stroke-width="1" opacity=".3"/>
-              </svg>
-            </div>
-            <p>Send a message to see which features activate</p>
-          </div>
-
-          <!-- Graph view -->
-          <div class="attr-view" id="attr-graph-view" hidden>
-            <div id="attr-graph" class="attr-graph" aria-label="Attribution graph"></div>
-          </div>
-
-          <!-- List view -->
-          <div class="attr-view" id="attr-list-view" hidden>
-            <div class="attr-section">
-              <div class="attr-section-title">
-                <span class="section-dot input-dot"></span>
-                Input features
-                <span class="section-count" id="input-count">—</span>
-              </div>
-              <div id="input-features" class="feature-card-list" role="list" aria-label="Input features"></div>
-            </div>
-            <div class="attr-section">
-              <div class="attr-section-title">
-                <span class="section-dot output-dot"></span>
-                Output features
-                <span class="section-count" id="output-count">—</span>
-              </div>
-              <div id="output-features" class="feature-card-list" role="list" aria-label="Output features"></div>
-            </div>
-          </div>
-
-        </aside>
 
       </div>
     </section>
