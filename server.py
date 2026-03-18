@@ -179,8 +179,15 @@ def _encode_text(text: str) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
     return hidden, tokens, token_strs
 
 
-def _top_features(hidden: torch.Tensor, top_k: int = 8, threshold: float = 0.3) -> List[Dict]:
-    """Return top-k feature dicts from SAE hidden activations."""
+
+def _top_features_full(
+    hidden: torch.Tensor,
+    top_k: int = 8,
+    threshold: float = 0.3,
+    include_source: bool = False,
+) -> List[Dict]:
+    """Like _top_features but also returns token_indices (top positions in the sequence),
+    and optionally source_breakdown + max_act_examples for output attribution."""
     max_per_feat = hidden.max(dim=0).values.cpu()
     vals, idxs = max_per_feat.topk(min(top_k * 3, max_per_feat.shape[0]))
     results = []
@@ -198,14 +205,49 @@ def _top_features(hidden: torch.Tensor, top_k: int = 8, threshold: float = 0.3) 
             if e.get("token", "").strip() and e.get("token", "").strip() not in _SPECIAL_TOKENS
         ]
         vocab_proj = fdata.get("vocab_projection", [])[:6]
-        results.append({
+
+        # Which positions in the sequence activated this feature most?
+        feat_acts = hidden[:, idx].cpu()
+        n_top = min(3, feat_acts.shape[0])
+        top_tok = feat_acts.topk(n_top)
+        token_indices = [
+            int(i) for i, v in zip(top_tok.indices.tolist(), top_tok.values.tolist())
+            if v > threshold * 0.4
+        ]
+
+        entry: Dict = {
             "index": idx,
             "label": label,
             "confidence": conf,
             "activation": round(val, 3),
             "evidence": evidence,
             "vocab_proj": vocab_proj,
-        })
+            "token_indices": token_indices,
+        }
+
+        if include_source:
+            source_counts: Dict[str, int] = {}
+            for tok in max_act_list[:20]:
+                sid = tok.get("source_id", "")
+                if sid:
+                    prefix = sid.split(":")[0]
+                    source_counts[prefix] = source_counts.get(prefix, 0) + 1
+            entry["source_breakdown"] = source_counts
+
+            examples = []
+            for tok in max_act_list[:5]:
+                t = tok.get("token", "")
+                if t.strip() and t.strip() not in _SPECIAL_TOKENS:
+                    sid = tok.get("source_id", "")
+                    examples.append({
+                        "token": t,
+                        "activation": round(tok.get("activation", 0), 3),
+                        "context": tok.get("context", "")[:300],
+                        "source": sid.split(":")[0] if sid else "unknown",
+                    })
+            entry["max_act_examples"] = examples
+
+        results.append(entry)
     return results
 
 
@@ -262,8 +304,13 @@ async def chat_stream(req: ChatRequest):
             prompt = _build_prompt(req.message, req.history)
 
             _put({"type": "log", "text": "Input attribution · SAE encode"})
-            input_hidden, _, _ = _encode_text(req.message)
-            input_features = _top_features(input_hidden, top_k=8)
+            input_hidden_full, input_raw_tokens, _ = _encode_text(req.message)
+            # Skip BOS at position 0 so token_indices align with input_token_strs
+            input_token_strs = [
+                srv.model.tokenizer.decode([t])
+                for t in input_raw_tokens[0].tolist()[1:]
+            ]
+            input_features = _top_features_full(input_hidden_full[1:], top_k=8)
 
             # ── 3. Generate (uses KV cache — fast) ───────────────────────────
             _put({"type": "log", "text": "Generating response"})
@@ -288,7 +335,6 @@ async def chat_stream(req: ChatRequest):
             response = srv.model.tokenizer.decode(response_ids.tolist())
 
             # ── 4. Output attribution ────────────────────────────────────────
-            _put({"type": "log", "text": "Output attribution · SAE encode"})
             hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
             prompt_len = tokens.shape[1]
             with torch.no_grad():
@@ -298,11 +344,18 @@ async def chat_stream(req: ChatRequest):
                 if gen_acts.shape[0] == 0:
                     gen_acts = activations
                 output_hidden = srv.sae.encode(gen_acts.to(srv.device))
-            output_features = _top_features(output_hidden, top_k=8)
+            output_features = _top_features_full(output_hidden, top_k=8, include_source=True)
+
+            # Response tokens — keep all (incl. EOS placeholder) so token_indices align
+            response_token_strs = [
+                srv.model.tokenizer.decode([t]) for t in response_ids.tolist()
+            ]
 
             _put({
                 "type": "result",
                 "response": response,
+                "input_tokens": input_token_strs,
+                "response_tokens": response_token_strs,
                 "input_features": input_features,
                 "output_features": output_features,
             })
