@@ -121,18 +121,23 @@ async function sendMessage(message) {
           }
           history.push({ role: 'assistant', content: responseText });
 
+          // Prioritise labeled features (confidence !== 'unknown') before unlabeled ones,
+          // preserving activation order within each group.
+          const inputFeatures  = prioritizeLabeled(evt.input_features  || []);
+          const outputFeatures = prioritizeLabeled(evt.output_features || []);
+
           // Re-render user message with coloured token highlights
-          if (evt.input_tokens?.length && evt.input_features?.length) {
+          if (evt.input_tokens?.length && inputFeatures.length) {
             const userBody = userMsgEl.querySelector('.message-body');
             if (userBody) {
               userBody.innerHTML = renderHighlightedTokens(
-                evt.input_tokens, evt.input_features, PALETTE
+                evt.input_tokens, inputFeatures, PALETTE
               );
             }
           }
 
           // Re-render assistant response with coloured token highlights
-          if (evt.response_tokens?.length && evt.output_features?.length) {
+          if (evt.response_tokens?.length && outputFeatures.length) {
             const body = msgEl.querySelector('.message-body');
             if (body) {
               const SKIP = new Set(['<|eot_id|>', '<|end_of_text|>', '<|begin_of_text|>']);
@@ -140,14 +145,14 @@ async function sendMessage(message) {
                 t && !SKIP.has(t.trim()) ? t : ''
               );
               body.innerHTML = renderHighlightedTokens(
-                cleanTokens, evt.output_features, PALETTE
+                cleanTokens, outputFeatures, PALETTE
               );
             }
           }
 
           // Render side panels
-          renderInputPanel(leftPanelEl, { inputFeatures: evt.input_features || [] });
-          renderOutputPanel(rightPanelEl, { outputFeatures: evt.output_features || [] });
+          renderInputPanel(leftPanelEl, { inputFeatures });
+          renderOutputPanel(rightPanelEl, { outputFeatures });
 
 
         } else if (evt.type === 'error') {
@@ -255,4 +260,12 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/\n/g, '<br>');
+}
+
+// Labeled features (confidence !== 'unknown') float to the top;
+// activation order is preserved within each group.
+function prioritizeLabeled(features) {
+  const labeled   = features.filter(f => f.confidence !== 'unknown');
+  const unlabeled = features.filter(f => f.confidence === 'unknown');
+  return [...labeled, ...unlabeled];
 }

@@ -196,13 +196,20 @@ def _top_features_full(
     """Like _top_features but also returns token_indices (top positions in the sequence),
     and optionally source_breakdown + max_act_examples for output attribution."""
     max_per_feat = hidden.max(dim=0).values.cpu()
-    vals, idxs = max_per_feat.topk(min(top_k * 3, max_per_feat.shape[0]))
+    # Gather a wide candidate pool (top_k * 5) above threshold
+    pool_size = min(top_k * 5, max_per_feat.shape[0])
+    vals_all, idxs_all = max_per_feat.topk(pool_size)
+    candidates = [
+        (val, idx) for val, idx in zip(vals_all.tolist(), idxs_all.tolist())
+        if val >= threshold
+    ]
+    # Prioritize labeled features (confidence != 'unknown'), then unlabeled, both sorted by activation
+    labeled_set = {i for _, i in candidates if srv.feature_by_index.get(i, {}).get("confidence", "unknown") != "unknown"}
+    labeled   = [(v, i) for v, i in candidates if i in labeled_set]
+    unlabeled = [(v, i) for v, i in candidates if i not in labeled_set]
+    ordered = (labeled + unlabeled)[:top_k]
     results = []
-    for val, idx in zip(vals.tolist(), idxs.tolist()):
-        if val < threshold:
-            break
-        if len(results) >= top_k:
-            break
+    for val, idx in ordered:
         fdata = srv.feature_by_index.get(idx, {})
         label = fdata.get("label", f"Feature {idx}")
         conf = fdata.get("confidence", "unknown")
@@ -434,7 +441,21 @@ def _do_steer(prompt: str, feature_strengths: Dict[int, float], max_tokens: int)
 
     steer_unit = steer_direction / (steer_direction.norm() + 1e-8)
     total_strength = steering_vector.abs().max().item()
-    scaled_steer = steer_unit * total_strength * resid_norm * 0.05
+    # Scale: strength 10 → ~10% of resid_norm, capped at 25% to prevent gibberish.
+    # Previously used `total_strength * resid_norm * 0.05` which double-applied strength
+    # (decoder cols are unit-norm so steer_direction.norm() ≈ total_strength already).
+    scale_frac = min(total_strength * 0.01, 0.25)
+    scaled_steer = steer_unit * resid_norm * scale_frac
+
+    def _sample_top_p(logits: torch.Tensor, temperature: float = 0.7, top_p: float = 0.9) -> torch.Tensor:
+        probs = torch.softmax(logits / temperature, dim=-1)
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        sorted_probs = sorted_probs.clone()
+        sorted_probs[(cumulative_probs - sorted_probs) > top_p] = 0.0
+        sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+        sample_idx = torch.multinomial(sorted_probs, num_samples=1)
+        return sorted_indices.gather(-1, sample_idx)
 
     def steering_hook(activation, hook):
         activation[:, :, :] += scaled_steer.unsqueeze(0).unsqueeze(0)
@@ -447,8 +468,7 @@ def _do_steer(prompt: str, feature_strengths: Dict[int, float], max_tokens: int)
             srv.model.add_hook(hook_point, steering_hook)
             logits = srv.model(tokens)[:, -1, :]
             srv.model.reset_hooks()
-            probs = torch.softmax(logits / 0.7, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            next_token = _sample_top_p(logits)
             tokens = torch.cat([tokens, next_token], dim=1)
             if next_token.item() == srv.model.tokenizer.eos_token_id:
                 break
@@ -477,8 +497,11 @@ async def circuit(req: CircuitRequest):
         filtered = hidden_np[valid_idxs]              # [n_valid_tokens, n_features]
         max_per_feat = filtered.max(axis=0)            # [n_features]
         activated = np.where(max_per_feat > 0.5)[0]
-        sorted_by_act = activated[np.argsort(max_per_feat[activated])[::-1]]
-        top_indices = sorted_by_act[:20].tolist()
+        sorted_by_act = activated[np.argsort(max_per_feat[activated])[::-1]].tolist()
+        # Labeled features first, then unlabeled, both sorted by activation
+        labeled_idxs   = [i for i in sorted_by_act if srv.feature_by_index.get(int(i), {}).get("label", "").strip()]
+        unlabeled_idxs = [i for i in sorted_by_act if int(i) not in {int(x) for x in labeled_idxs}]
+        top_indices = (labeled_idxs + unlabeled_idxs)[:20]
 
         features = []
         for feat_idx in top_indices:
