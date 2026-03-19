@@ -3,9 +3,16 @@
 Medical SAE pipeline for Llama 3.2 1B.
 
 Usage:
-    python main.py              # Full pipeline (collect activations → train SAE → analyze)
-    python main.py --quick      # Quick test (500 samples, 1 epoch)
-    python main.py --skip-collection    # Skip activation collection (reuse cached)
+    python main.py                          # Full pipeline, layer 8 (default)
+    python main.py --layers 4 8 12         # Train SAEs on layers 4, 8, and 12
+    python main.py --quick                  # Quick test (500 samples, 1 epoch)
+    python main.py --skip-collection        # Reuse cached activations
+    python main.py --device mps             # Force device
+
+Output layout:
+    Single layer (default)  → medical_outputs/
+    Multi-layer             → medical_outputs/layer_N/  per layer
+                              medical_outputs/cross_layer_analysis.json
 """
 
 import torch
@@ -17,6 +24,7 @@ from typing import Optional, List, Dict
 from tqdm import tqdm
 import argparse
 import json
+from collections import Counter
 
 from transformer_lens import HookedTransformer
 
@@ -297,6 +305,49 @@ def train_sae(
 # =============================================================================
 # Feature Analysis (Input-centric + Output-centric methods from lit review)
 # =============================================================================
+
+def token_entropy(max_act_examples: List[MaxActExample]) -> float:
+    """
+    Shannon entropy (bits) of the MaxAct token distribution for one feature.
+
+    Low entropy  → monosemantic: feature fires on a tight cluster of similar tokens.
+    High entropy → polysemantic: feature fires broadly across unrelated tokens.
+
+    Tokens are lowercased and stripped so surface variants ("The"/"the") don't
+    artificially inflate diversity.  Returns 0.0 for features with ≤1 example.
+    """
+    import math
+
+    tokens = [ex.token.strip().lower() for ex in max_act_examples if ex.token.strip()]
+    if len(tokens) <= 1:
+        return 0.0
+    counts = Counter(tokens)
+    total = sum(counts.values())
+    return round(-sum((c / total) * math.log2(c / total) for c in counts.values()), 4)
+
+
+def source_breakdown(max_act_examples: List[MaxActExample], all_sources: List[str]) -> Dict[str, float]:
+    """
+    Fraction of a feature's MaxAct examples that come from each source dataset.
+
+    source_id strings are in the form "dataset:doc_index" (e.g. "medmcqa:54").
+    This function aggregates by the dataset prefix (the part before the colon)
+    so the result is always a 3-key dict over {medmcqa, pubmed_qa, pubmed_abs}.
+
+    Returns a sparse dict — only datasets that actually appear are included.
+    An empty dict means source tracking was unavailable.
+    """
+    # Aggregate by dataset prefix, ignoring the per-document index
+    counts: Dict[str, int] = Counter()
+    for ex in max_act_examples:
+        if ex.source_id:
+            dataset = ex.source_id.split(":")[0]
+            counts[dataset] += 1
+    total = sum(counts.values())
+    if total == 0:
+        return {}
+    return {dataset: round(count / total, 4) for dataset, count in sorted(counts.items())}
+
 
 def build_context_string(global_token_idx: int, token_ids: torch.Tensor, tokenizer, window: int = 50) -> str:
     """
@@ -605,6 +656,8 @@ def analyze_features(
             vocab_projection_logits=vocab_logit_values,
             position_mean=pos_mean,
             position_std=pos_std,
+            maxact_entropy=token_entropy(max_act_examples[:10]),
+            source_breakdown=source_breakdown(max_act_examples[:10], source_list or []),
         )
         features_info.append(info)
     
@@ -674,11 +727,12 @@ def save_results(
             feature_count += (features > 0).float().sum(dim=0)
             total_l0 += (features > 0).float().sum(dim=-1).sum().item()
             n_tokens += batch.shape[0]
-            # Accumulate for explained variance
-            b = batch.double().cpu()
+            # Accumulate for explained variance (move to CPU before float64 cast —
+            # MPS does not support float64, so the cast must happen on CPU)
+            b = batch.cpu().double()
             sum_x   += b.sum(dim=0)
             sum_x2  += (b ** 2).sum(dim=0)
-            sum_res2 += residual.double().pow(2).sum().item()
+            sum_res2 += residual.cpu().double().pow(2).sum().item()
         del chunk
         gc.collect()
 
@@ -717,6 +771,10 @@ def save_results(
             # Positional: where in the sequence this feature tends to fire
             "position_mean": round(f.position_mean, 2),
             "position_std": round(f.position_std, 2),
+            # Monosemanticity proxy: precomputed in analyze_features()
+            "maxact_entropy": f.maxact_entropy,
+            # Source attribution: precomputed in analyze_features()
+            "source_breakdown": f.source_breakdown,
         }
         for f in features_info
     ]

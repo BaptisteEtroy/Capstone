@@ -264,13 +264,21 @@ def _top_features_full(
         }
 
         if include_source:
-            source_counts: Dict[str, int] = {}
-            for tok in max_act_list[:20]:
-                sid = tok.get("source_id", "")
-                if sid:
-                    prefix = sid.split(":")[0]
-                    source_counts[prefix] = source_counts.get(prefix, 0) + 1
-            entry["source_breakdown"] = source_counts
+            # Use the precomputed breakdown from features.json (populated by analyze_features).
+            # Falls back to counting source_id prefixes inline if field is absent (legacy data).
+            if fdata.get("source_breakdown"):
+                entry["source_breakdown"] = fdata["source_breakdown"]
+            else:
+                source_counts: Dict[str, float] = {}
+                for tok in max_act_list[:20]:
+                    sid = tok.get("source_id", "")
+                    if sid:
+                        prefix = sid.split(":")[0]
+                        source_counts[prefix] = source_counts.get(prefix, 0) + 1
+                total = sum(source_counts.values())
+                if total:
+                    source_counts = {k: round(v / total, 4) for k, v in source_counts.items()}
+                entry["source_breakdown"] = source_counts
 
             examples = []
             for tok in max_act_list[:5]:

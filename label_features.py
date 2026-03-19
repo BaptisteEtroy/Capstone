@@ -34,7 +34,7 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 load_dotenv()
 
-from config import MEDICAL_OUTPUT_DIR, MEDICAL_FEATURES_PATH, TARGET_LAYER
+from config import MEDICAL_OUTPUT_DIR, TARGET_LAYER
 
 MAX_TOKENS_PER_SEQ = 128  # must match max_tokens in collect_activations
 
@@ -54,6 +54,8 @@ class LabeledFeature:
     reasoning: str
     quality_score: float = 0.0
     label_source: str = "claude"   # "claude" | "heuristic_token" | "heuristic_positional"
+    maxact_entropy: float = 0.0    # Shannon entropy of MaxAct token distribution (low = monosemantic)
+    source_breakdown: Dict[str, float] = field(default_factory=dict)  # fraction from each dataset
 
 
 # =============================================================================
@@ -109,6 +111,9 @@ def compute_quality_score(feature: Dict[str, Any]) -> float:
     - vocab_score:     More VocabProj tokens → clearer output-centric signal.
     - act_score:       Higher mean activation → stronger, more distinctive feature.
     - diversity_score: MaxAct tokens should be diverse (all-same → catch-all feature).
+    - entropy_score:   Low Shannon entropy → tokens cluster on a narrow concept
+                       (monosemantic). Normalized by log2(10) ≈ 3.32 bits (max for
+                       10 unique tokens with uniform distribution).
 
     freq_score is double-weighted as the strongest signal for monosemanticity.
     """
@@ -136,7 +141,14 @@ def compute_quality_score(feature: Dict[str, Any]) -> float:
             most_common_ratio = tokens.count(max(set(tokens), key=tokens.count)) / len(tokens)
             diversity_score = max(0.0, 1.0 - max(0.0, most_common_ratio - 0.4) / 0.6)
 
-    return (freq_score * 2 + max_act_score + vocab_score + act_score + diversity_score) / 6
+    entropy = feature.get("maxact_entropy", None)
+    if entropy is not None:
+        _MAX_ENTROPY = math.log2(10)  # uniform over 10 unique tokens ≈ 3.32 bits
+        entropy_score = max(0.0, 1.0 - entropy / _MAX_ENTROPY)
+    else:
+        entropy_score = diversity_score  # fallback: mirror diversity score
+
+    return (freq_score * 2 + max_act_score + vocab_score + act_score + diversity_score + entropy_score) / 7
 
 
 def filter_high_quality_features(
@@ -279,6 +291,9 @@ def heuristic_label_feature(feature: Dict[str, Any]) -> Optional[LabeledFeature]
         vp_logits = feature.get("vocab_projection_logits", [None] * 10)[:10]
         return list(zip(vp_tokens, vp_logits))
 
+    entropy = feature.get("maxact_entropy", 0.0)
+    src_breakdown = feature.get("source_breakdown", {})
+
     result = _token_pattern_label(max_act_tokens)
     if result:
         label, conf = result
@@ -287,6 +302,7 @@ def heuristic_label_feature(feature: Dict[str, Any]) -> Optional[LabeledFeature]
             max_act_tokens=_act_tuples(), vocab_proj_tokens=_vocab_tuples(),
             reasoning="Heuristic: token string pattern analysis",
             quality_score=quality, label_source="heuristic_token",
+            maxact_entropy=entropy, source_breakdown=src_breakdown,
         )
 
     pos_mean = feature.get("position_mean", 0.0)
@@ -299,6 +315,7 @@ def heuristic_label_feature(feature: Dict[str, Any]) -> Optional[LabeledFeature]
             max_act_tokens=_act_tuples(), vocab_proj_tokens=_vocab_tuples(),
             reasoning=f"Heuristic: positional (mean={pos_mean:.1f}, std={pos_std:.1f})",
             quality_score=quality, label_source="heuristic_positional",
+            maxact_entropy=entropy, source_breakdown=src_breakdown,
         )
 
     return None
@@ -399,9 +416,11 @@ def build_batch_prompt(features_batch: List[Dict[str, Any]]) -> str:
             else:
                 vocab_parts.append(repr(tok))
 
+        src_bd = feature.get("source_breakdown", {})
+        src_str = ", ".join(f"{k}={v*100:.0f}%" for k, v in sorted(src_bd.items())) if src_bd else "unknown"
         features_text += f"""
 ---
-FEATURE {feature['index']} (freq={feature['frequency']*100:.2f}%, mean_act={feature.get('mean_activation', 0):.3f})
+FEATURE {feature['index']} (freq={feature['frequency']*100:.2f}%, mean_act={feature.get('mean_activation', 0):.3f}, sources: {src_str})
 Triggers (MaxAct, sampled across activation quantiles):
   {chr(10).join(f'  {p}' for p in max_act_parts) if max_act_parts else '  No data'}
 Promotes (VocabProj, logit boost):
@@ -562,6 +581,8 @@ def label_features(
                         reasoning=reasoning,
                         quality_score=quality_scores[feature_id],
                         label_source="claude",
+                        maxact_entropy=feature_lookup[feature_id].get("maxact_entropy", 0.0),
+                        source_breakdown=feature_lookup[feature_id].get("source_breakdown", {}),
                     ))
                 else:
                     unlabeled_count += 1
@@ -625,6 +646,8 @@ def save_labeled_features(labeled_features: List[LabeledFeature], output_path: P
             "vocab_proj_logits": vp_logits,
             "reasoning":         f.reasoning,
             "quality_score":     round(f.quality_score, 4),
+            "maxact_entropy":    round(f.maxact_entropy, 4),
+            "source_breakdown":  f.source_breakdown,
         })
 
     with open(output_path, "w") as f:

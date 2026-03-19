@@ -7,9 +7,9 @@ Central configuration and reusable classes for the SAE interpretability pipeline
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Dict
 
 
 # =============================================================================
@@ -19,7 +19,6 @@ from typing import List
 # Model: Llama 3.2 1B (instruction-tuned)
 MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 D_MODEL = 2048
-N_LAYERS = 16
 
 # Layer: Middle layer for semantic features
 TARGET_LAYER = 8
@@ -43,14 +42,7 @@ BATCH_SIZE = 4096
 NUM_SAMPLES = 500_000   
 
 # Output
-OUTPUT_DIR = Path("outputs")
-SAE_PATH = OUTPUT_DIR / "sae.pt"
-FEATURES_PATH = OUTPUT_DIR / "features.json"
-
-# Medical outputs
 MEDICAL_OUTPUT_DIR = Path("medical_outputs")
-MEDICAL_SAE_PATH = MEDICAL_OUTPUT_DIR / "sae.pt"
-MEDICAL_FEATURES_PATH = MEDICAL_OUTPUT_DIR / "features.json"
 
 
 # =============================================================================
@@ -110,6 +102,12 @@ class FeatureInfo:
     vocab_projection_logits: List[float]
     position_mean: float = 0.0
     position_std: float = 0.0
+    # Monosemanticity proxy: Shannon entropy of MaxAct token distribution (bits).
+    # Low entropy = feature fires on a tight token cluster = more monosemantic.
+    maxact_entropy: float = 0.0
+    # Fraction of MaxAct examples that came from each training dataset.
+    # Keys are source_id strings (e.g. "medmcqa", "pubmed_qa", "pubmed_abs").
+    source_breakdown: Dict[str, float] = field(default_factory=dict)
 
 
 # =============================================================================
