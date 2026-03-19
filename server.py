@@ -74,6 +74,13 @@ class ServerState:
                 with open(features_path) as f:
                     all_feats = json.load(f)
                 self.feature_by_index = {feat["index"]: feat for feat in all_feats}
+                label_map = {f["index"]: f for f in self.labeled_features}
+                for feat in all_feats:
+                    if feat["index"] in label_map:
+                        lbl = label_map[feat["index"]]
+                        self.feature_by_index[feat["index"]]["label"] = lbl.get("label", "")
+                        self.feature_by_index[feat["index"]]["confidence"] = lbl.get("confidence", "low")
+                        self.feature_by_index[feat["index"]]["reasoning"] = lbl.get("reasoning", "")
             self.loaded = True
             print(f"Ready — {len(self.labeled_features)} labeled features")
         except Exception as e:
@@ -179,16 +186,30 @@ def _encode_text(text: str) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
     return hidden, tokens, token_strs
 
 
-def _top_features(hidden: torch.Tensor, top_k: int = 8, threshold: float = 0.3) -> List[Dict]:
-    """Return top-k feature dicts from SAE hidden activations."""
+
+def _top_features_full(
+    hidden: torch.Tensor,
+    top_k: int = 8,
+    threshold: float = 0.3,
+    include_source: bool = False,
+) -> List[Dict]:
+    """Like _top_features but also returns token_indices (top positions in the sequence),
+    and optionally source_breakdown + max_act_examples for output attribution."""
     max_per_feat = hidden.max(dim=0).values.cpu()
-    vals, idxs = max_per_feat.topk(min(top_k * 3, max_per_feat.shape[0]))
+    # Gather a wide candidate pool (top_k * 5) above threshold
+    pool_size = min(top_k * 5, max_per_feat.shape[0])
+    vals_all, idxs_all = max_per_feat.topk(pool_size)
+    candidates = [
+        (val, idx) for val, idx in zip(vals_all.tolist(), idxs_all.tolist())
+        if val >= threshold
+    ]
+    # Prioritize labeled features (confidence != 'unknown'), then unlabeled, both sorted by activation
+    labeled_set = {i for _, i in candidates if srv.feature_by_index.get(i, {}).get("confidence", "unknown") != "unknown"}
+    labeled   = [(v, i) for v, i in candidates if i in labeled_set]
+    unlabeled = [(v, i) for v, i in candidates if i not in labeled_set]
+    ordered = (labeled + unlabeled)[:top_k]
     results = []
-    for val, idx in zip(vals.tolist(), idxs.tolist()):
-        if val < threshold:
-            break
-        if len(results) >= top_k:
-            break
+    for val, idx in ordered:
         fdata = srv.feature_by_index.get(idx, {})
         label = fdata.get("label", f"Feature {idx}")
         conf = fdata.get("confidence", "unknown")
@@ -198,28 +219,56 @@ def _top_features(hidden: torch.Tensor, top_k: int = 8, threshold: float = 0.3) 
             if e.get("token", "").strip() and e.get("token", "").strip() not in _SPECIAL_TOKENS
         ]
         vocab_proj = fdata.get("vocab_projection", [])[:6]
-        results.append({
+
+        # Which positions in the sequence activated this feature most?
+        feat_acts = hidden[:, idx].cpu()
+        n_top = min(3, feat_acts.shape[0])
+        top_tok = feat_acts.topk(n_top)
+        token_indices = [
+            int(i) for i, v in zip(top_tok.indices.tolist(), top_tok.values.tolist())
+            if v > threshold * 0.4
+        ]
+
+        entry: Dict = {
             "index": idx,
             "label": label,
             "confidence": conf,
             "activation": round(val, 3),
             "evidence": evidence,
             "vocab_proj": vocab_proj,
-        })
+            "token_indices": token_indices,
+        }
+
+        if include_source:
+            source_counts: Dict[str, int] = {}
+            for tok in max_act_list[:20]:
+                sid = tok.get("source_id", "")
+                if sid:
+                    prefix = sid.split(":")[0]
+                    source_counts[prefix] = source_counts.get(prefix, 0) + 1
+            entry["source_breakdown"] = source_counts
+
+            examples = []
+            for tok in max_act_list[:5]:
+                t = tok.get("token", "")
+                if t.strip() and t.strip() not in _SPECIAL_TOKENS:
+                    sid = tok.get("source_id", "")
+                    examples.append({
+                        "token": t,
+                        "activation": round(tok.get("activation", 0), 3),
+                        "context": tok.get("context", "")[:300],
+                        "source": sid.split(":")[0] if sid else "unknown",
+                    })
+            entry["max_act_examples"] = examples
+
+        results.append(entry)
     return results
 
 
 def _build_prompt(message: str, history: List[Dict[str, str]]) -> str:
-    prompt = ""
-    for turn in (history or []):
-        role = turn.get("role", "user")
-        content = turn.get("content", "")
-        if role == "user":
-            prompt += f"User: {content}\nAssistant: "
-        else:
-            prompt += f"{content}\n"
-    prompt += f"User: {message}\nAssistant:"
-    return prompt
+    messages = [{"role": t.get("role", "user"), "content": t.get("content", "")} for t in (history or [])]
+    messages.append({"role": "user", "content": message})
+    return srv.model.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
 # =============================================================================
@@ -262,8 +311,13 @@ async def chat_stream(req: ChatRequest):
             prompt = _build_prompt(req.message, req.history)
 
             _put({"type": "log", "text": "Input attribution · SAE encode"})
-            input_hidden, _, _ = _encode_text(req.message)
-            input_features = _top_features(input_hidden, top_k=8)
+            input_hidden_full, input_raw_tokens, _ = _encode_text(req.message)
+            # Skip BOS at position 0 so token_indices align with input_token_strs
+            input_token_strs = [
+                srv.model.tokenizer.decode([t])
+                for t in input_raw_tokens[0].tolist()[1:]
+            ]
+            input_features = _top_features_full(input_hidden_full[1:], top_k=8)
 
             # ── 3. Generate (uses KV cache — fast) ───────────────────────────
             _put({"type": "log", "text": "Generating response"})
@@ -288,7 +342,6 @@ async def chat_stream(req: ChatRequest):
             response = srv.model.tokenizer.decode(response_ids.tolist())
 
             # ── 4. Output attribution ────────────────────────────────────────
-            _put({"type": "log", "text": "Output attribution · SAE encode"})
             hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
             prompt_len = tokens.shape[1]
             with torch.no_grad():
@@ -298,11 +351,18 @@ async def chat_stream(req: ChatRequest):
                 if gen_acts.shape[0] == 0:
                     gen_acts = activations
                 output_hidden = srv.sae.encode(gen_acts.to(srv.device))
-            output_features = _top_features(output_hidden, top_k=8)
+            output_features = _top_features_full(output_hidden, top_k=8, include_source=True)
+
+            # Response tokens — keep all (incl. EOS placeholder) so token_indices align
+            response_token_strs = [
+                srv.model.tokenizer.decode([t]) for t in response_ids.tolist()
+            ]
 
             _put({
                 "type": "result",
                 "response": response,
+                "input_tokens": input_token_strs,
+                "response_tokens": response_token_strs,
                 "input_features": input_features,
                 "output_features": output_features,
             })
@@ -335,7 +395,9 @@ async def steer(req: SteerRequest):
 
     try:
         features = {int(k): v for k, v in req.features.items()}
-        baseline_text, steered_text = _do_steer(req.prompt, features, req.max_tokens)
+        messages = [{"role": "user", "content": req.prompt}]
+        prompt = srv.model.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        baseline_text, steered_text = _do_steer(prompt, features, req.max_tokens)
 
         feature_labels = []
         for idx, strength in features.items():
@@ -362,41 +424,56 @@ def _do_steer(prompt: str, feature_strengths: Dict[int, float], max_tokens: int)
 
     hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
     tokens_orig = srv.model.to_tokens(prompt)
+    input_len = tokens_orig.shape[1]
 
     with torch.no_grad():
         output_orig = srv.model.generate(
-            tokens_orig, max_new_tokens=max_tokens, do_sample=True, temperature=0.8, top_p=0.9,
+            tokens_orig, max_new_tokens=max_tokens, do_sample=True, temperature=0.7, top_p=0.9,
         )
-    text_orig = srv.model.tokenizer.decode(output_orig[0])
+    text_orig = srv.model.tokenizer.decode(output_orig[0][input_len:], skip_special_tokens=True)
 
     if steering_vector.abs().sum() < 0.1:
         return text_orig, text_orig
 
     with torch.no_grad():
-        _, cache = srv.model.run_with_cache(srv.model.to_tokens(prompt))
+        _, cache = srv.model.run_with_cache(tokens_orig)
         resid_norm = cache[hook_point][0].norm(dim=-1).mean().item()
 
     steer_unit = steer_direction / (steer_direction.norm() + 1e-8)
     total_strength = steering_vector.abs().max().item()
-    scaled_steer = steer_unit * total_strength * resid_norm * 0.1
+    # Scale: strength 10 → ~10% of resid_norm, capped at 25% to prevent gibberish.
+    # Previously used `total_strength * resid_norm * 0.05` which double-applied strength
+    # (decoder cols are unit-norm so steer_direction.norm() ≈ total_strength already).
+    scale_frac = min(total_strength * 0.01, 0.25)
+    scaled_steer = steer_unit * resid_norm * scale_frac
+
+    def _sample_top_p(logits: torch.Tensor, temperature: float = 0.7, top_p: float = 0.9) -> torch.Tensor:
+        probs = torch.softmax(logits / temperature, dim=-1)
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        sorted_probs = sorted_probs.clone()
+        sorted_probs[(cumulative_probs - sorted_probs) > top_p] = 0.0
+        sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+        sample_idx = torch.multinomial(sorted_probs, num_samples=1)
+        return sorted_indices.gather(-1, sample_idx)
 
     def steering_hook(activation, hook):
         activation[:, :, :] += scaled_steer.unsqueeze(0).unsqueeze(0)
         return activation
 
     tokens = srv.model.to_tokens(prompt)
+    steer_input_len = tokens.shape[1]
     with torch.no_grad():
         for _ in range(max_tokens):
             srv.model.add_hook(hook_point, steering_hook)
             logits = srv.model(tokens)[:, -1, :]
             srv.model.reset_hooks()
-            probs = torch.softmax(logits / 0.8, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            next_token = _sample_top_p(logits)
             tokens = torch.cat([tokens, next_token], dim=1)
             if next_token.item() == srv.model.tokenizer.eos_token_id:
                 break
 
-    text_steer = srv.model.tokenizer.decode(tokens[0])
+    text_steer = srv.model.tokenizer.decode(tokens[0][steer_input_len:], skip_special_tokens=True)
     return text_orig, text_steer
 
 
@@ -420,8 +497,11 @@ async def circuit(req: CircuitRequest):
         filtered = hidden_np[valid_idxs]              # [n_valid_tokens, n_features]
         max_per_feat = filtered.max(axis=0)            # [n_features]
         activated = np.where(max_per_feat > 0.5)[0]
-        sorted_by_act = activated[np.argsort(max_per_feat[activated])[::-1]]
-        top_indices = sorted_by_act[:20].tolist()
+        sorted_by_act = activated[np.argsort(max_per_feat[activated])[::-1]].tolist()
+        # Labeled features first, then unlabeled, both sorted by activation
+        labeled_idxs   = [i for i in sorted_by_act if srv.feature_by_index.get(int(i), {}).get("label", "").strip()]
+        unlabeled_idxs = [i for i in sorted_by_act if int(i) not in {int(x) for x in labeled_idxs}]
+        top_indices = (labeled_idxs + unlabeled_idxs)[:20]
 
         features = []
         for feat_idx in top_indices:

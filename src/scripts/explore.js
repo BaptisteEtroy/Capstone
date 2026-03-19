@@ -1,12 +1,15 @@
 /**
  * explore.js — Circuit Explorer panel
- * Tokenise input text, show activated features, render a D3 Sankey circuit.
+ * Tokenise input text, show activated features, render a D3 circuit.
  */
 
 import { apiPost } from './app.js';
 
+const SANKEY_FEATS = 8;   // features shown in diagram
+const TABLE_FEATS  = 20;  // features shown in table
+
 // ── Init ───────────────────────────────────────────────────────────────────────
-export function initExplore(appState) {
+export function initExplore(_appState) {
   const textEl  = document.getElementById('explore-text');
   const runBtn  = document.getElementById('explore-run-btn');
   const results = document.getElementById('explore-results');
@@ -18,6 +21,7 @@ export function initExplore(appState) {
     runBtn.disabled = true;
     runBtn.textContent = 'Analysing…';
     if (results) results.hidden = true;
+    clearDetail();
 
     try {
       const data = await apiPost('/api/circuit', { text });
@@ -33,24 +37,27 @@ export function initExplore(appState) {
     }
   });
 
-  // Enter key
   textEl?.addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runBtn?.click(); }
+  });
+
+  document.querySelectorAll('.explore-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      if (textEl) textEl.value = chip.dataset.prompt;
       runBtn?.click();
-    }
+    });
   });
 }
 
 // ── Render results ─────────────────────────────────────────────────────────────
 function renderResults({ tokens, features, links }) {
-  renderTokens(tokens, features, links);
-  renderCircuit(tokens, features, links);
+  renderTokens(tokens, links);
+  renderSankey(tokens, features, links);
   renderFeatureTable(features);
 }
 
 // ── Token display ──────────────────────────────────────────────────────────────
-function renderTokens(tokens, features, links) {
+function renderTokens(tokens, links) {
   const el = document.getElementById('explore-tokens');
   if (!el) return;
   el.innerHTML = '';
@@ -60,17 +67,17 @@ function renderTokens(tokens, features, links) {
     badge.className = 'token-badge';
     badge.textContent = tok;
     badge.title = `Token ${i}`;
+    badge.style.cursor = 'pointer';
 
-    // Highlight tokens that have strong links
     const strength = links.filter(l => l.source === i).reduce((s, l) => s + l.value, 0);
     if (strength > 1) {
       badge.style.borderColor = 'rgba(255,255,255,0.18)';
       badge.style.color = 'var(--text-1)';
     }
 
+    badge.addEventListener('click', () => highlightSVGLinks('source', i));
     badge.addEventListener('mouseenter', () => highlightLinksForToken(i, links));
     badge.addEventListener('mouseleave', () => resetHighlights());
-
     el.appendChild(badge);
   });
 }
@@ -78,8 +85,7 @@ function renderTokens(tokens, features, links) {
 function highlightLinksForToken(tokenIdx, links) {
   const active = new Set(links.filter(l => l.source === tokenIdx).map(l => l.target));
   document.querySelectorAll('.explore-feat-row').forEach(row => {
-    const featI = parseInt(row.dataset.featIdx);
-    row.classList.toggle('highlighted', active.has(featI));
+    row.classList.toggle('highlighted', active.has(parseInt(row.dataset.featIdx)));
   });
 }
 
@@ -87,122 +93,148 @@ function resetHighlights() {
   document.querySelectorAll('.explore-feat-row').forEach(r => r.classList.remove('highlighted'));
 }
 
-// ── Circuit SVG ────────────────────────────────────────────────────────────────
-function renderCircuit(tokens, features, links) {
+// ── SVG link highlighting ───────────────────────────────────────────────────────
+function highlightSVGLinks(type, idx) {
+  const paths = document.querySelectorAll('#explore-circuit .circuit-link');
+  paths.forEach(path => {
+    const src = parseInt(path.dataset.src);
+    const tgt = parseInt(path.dataset.tgt);
+    const match = (type === 'source' && src === idx) || (type === 'target' && tgt === idx);
+    path.style.stroke = match ? 'rgba(180,180,220,0.9)' : 'rgba(152,152,180,0.05)';
+    path.style.strokeWidth = match ? '2' : '0.5';
+  });
+}
+
+function resetSVGHighlights() {
+  const paths = document.querySelectorAll('#explore-circuit .circuit-link');
+  paths.forEach(path => {
+    path.style.stroke = '';
+    path.style.strokeWidth = '';
+  });
+}
+
+// ── Sankey diagram ─────────────────────────────────────────────────────────────
+function renderSankey(tokens, features, links) {
   const container = document.getElementById('explore-circuit');
   if (!container) return;
   container.innerHTML = '';
-
   if (!features.length) return;
 
-  const W     = container.offsetWidth || 600;
-  const NODE_H = 32;
-  const GAP    = 6;
-  const COL_W  = 130;
+  const topFeatures = features.slice(0, SANKEY_FEATS);
+  // All links pointing to displayed features, from any token
+  const visibleLinks = links.filter(l =>
+    l.source < tokens.length && l.target < topFeatures.length
+  );
 
-  const topFeatures = features.slice(0, 15);
-  const topTokens   = tokens.slice(0, 20);
+  const W           = container.offsetWidth || 700;
+  const TOK_NODE_W  = 160;
+  const TOK_H       = 24;
+  const FEAT_H      = 26;
+  const GAP         = 5;
+  const PAD         = 14;
+  // Measure feature label widths: IBM Plex Mono 9px ≈ 5.5px/char
+  const CHAR_W      = 5.5;
+  const FEAT_TEXT_PAD = 20;  // left(7) + right(13) padding inside node
+  const maxLabelPx  = Math.max(...topFeatures.map(f => f.label.length * CHAR_W));
+  const FEAT_NODE_W = Math.max(140, Math.ceil(maxLabelPx) + FEAT_TEXT_PAD);
 
-  const totalRows = Math.max(topTokens.length, topFeatures.length);
-  const H = totalRows * (NODE_H + GAP) + 50;
+  const numTok  = tokens.length;
+  const numFeat = topFeatures.length;
 
-  const inputX   = 0;
-  const outputX  = W - COL_W;
-  const midX     = W / 2;
+  const H = Math.max(
+    PAD + numTok  * (TOK_H  + GAP) - GAP + PAD,
+    PAD + numFeat * (FEAT_H + GAP) - GAP + PAD
+  );
+
+  const tokenY = tokens.map((_, i) => PAD + i * (TOK_H  + GAP));
+  const featY  = topFeatures.map((_, i) => PAD + i * (FEAT_H + GAP));
+
+  const leftX  = 0;
+  const rightX = W - FEAT_NODE_W;
+  const maxVal = Math.max(...visibleLinks.map(l => l.value), 1);
 
   const svg = d3.create('svg')
-    .attr('viewBox', `0 0 ${W} ${H}`)
-    .attr('width', W)
-    .attr('height', H);
+    .attr('width', W).attr('height', H)
+    .attr('viewBox', `0 0 ${W} ${H}`);
 
-  // Headers
-  const hStyle = 'font-family:IBM Plex Mono,monospace;font-size:9px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;';
-  const headerY = 12;
+  // Background click resets highlights
+  svg.on('click', () => resetSVGHighlights());
 
-  svg.append('text').attr('x', inputX + COL_W / 2).attr('y', headerY)
-    .attr('text-anchor', 'middle').attr('fill', 'var(--text-3)').attr('style', hStyle).text('TOKENS');
-
-  svg.append('text').attr('x', outputX + COL_W / 2).attr('y', headerY)
-    .attr('text-anchor', 'middle').attr('fill', 'var(--text-3)').attr('style', hStyle).text('FEATURES');
-
-  const startY = 24;
-
-  // Token y centres
-  const tokenY = topTokens.map((_, i) => startY + i * (NODE_H + GAP) + NODE_H / 2);
-  const featY  = topFeatures.map((_, i) => startY + i * (NODE_H + GAP) + NODE_H / 2);
-
-  // Find max activation for scaling
-  const maxAct = Math.max(...topFeatures.map(f => f.activation), 1);
-
-  // Draw links
-  const validLinks = links.filter(l => l.source < topTokens.length && l.target < topFeatures.length);
-  const maxVal = Math.max(...validLinks.map(l => l.value), 1);
-
-  validLinks.forEach(link => {
-    const x1 = inputX + COL_W + 8;
-    const x2 = outputX - 8;
-    const y1 = tokenY[link.source];
-    const y2 = featY[link.target];
-    const opacity = 0.08 + (link.value / maxVal) * 0.5;
-    const w = 0.5 + (link.value / maxVal) * 2;
+  // Links — thin bezier curves, width scaled by value
+  visibleLinks.forEach((link, idx) => {
+    const si = link.source, ti = link.target;
+    const x0 = leftX + TOK_NODE_W, x1 = rightX;
+    const y0 = tokenY[si] + TOK_H  / 2;
+    const y1 = featY[ti]  + FEAT_H / 2;
+    const mx = x0 + (x1 - x0) * 0.5;
+    const sw = Math.max(0.8, (link.value / maxVal) * 2.5);
 
     svg.append('path')
-      .attr('d', `M${x1},${y1} C${midX},${y1} ${midX},${y2} ${x2},${y2}`)
+      .attr('class', 'circuit-link')
+      .attr('data-src', si)
+      .attr('data-tgt', ti)
+      .attr('d', `M ${x0} ${y0} C ${mx} ${y0}, ${mx} ${y1}, ${x1} ${y1}`)
       .attr('fill', 'none')
-      .attr('stroke', '#6e6e78')
-      .attr('stroke-width', w)
-      .attr('stroke-opacity', 0)
-      .transition().delay((link.source + link.target) * 20).duration(200)
-      .attr('stroke-opacity', opacity);
+      .attr('stroke', 'rgba(152,152,180,0.30)')
+      .attr('stroke-width', sw)
+      .attr('opacity', 0)
+      .transition().duration(280).delay(idx * 15)
+      .attr('opacity', 1);
   });
 
-  // Draw token nodes
-  topTokens.forEach((tok, i) => {
-    const y = startY + i * (NODE_H + GAP);
-    const g = svg.append('g').attr('transform', `translate(${inputX},${y})`);
-
+  // Token nodes — all input tokens shown
+  tokens.forEach((tok, i) => {
+    const g = svg.append('g').attr('class', 'node-clickable');
     g.append('rect')
-      .attr('width', COL_W).attr('height', NODE_H).attr('rx', 4)
-      .attr('fill', 'var(--bg-3)').attr('stroke', 'var(--border-default)').attr('stroke-width', 0.6);
+      .attr('x', leftX).attr('y', tokenY[i])
+      .attr('width', TOK_NODE_W).attr('height', TOK_H).attr('rx', 3)
+      .attr('fill', 'var(--bg-3)').attr('stroke', 'var(--border-2)').attr('stroke-width', 0.5);
+
+    g.append('title').text(tok);
 
     g.append('text')
-      .attr('x', 8).attr('y', NODE_H / 2 + 4)
+      .attr('x', leftX + 8).attr('y', tokenY[i] + TOK_H / 2 + 4)
       .attr('fill', 'var(--text-2)')
-      .attr('font-family', 'IBM Plex Mono, monospace')
-      .attr('font-size', 10)
-      .text(tok.length > 14 ? tok.slice(0, 14) + '…' : tok);
+      .attr('font-family', 'IBM Plex Mono, monospace').attr('font-size', 10)
+      .text(tok.length > 20 ? tok.slice(0, 20) + '…' : tok);
+
+    g.on('click', (event) => {
+      event.stopPropagation();
+      highlightSVGLinks('source', i);
+    });
   });
 
-  // Draw feature nodes
+  // Feature nodes — 2-line labels so full text is visible
   topFeatures.forEach((feat, i) => {
-    const y = startY + i * (NODE_H + GAP);
-    const actRatio = feat.activation / maxAct;
+    const g = svg.append('g').attr('class', 'node-clickable');
     const confColor = CONF_COLORS[feat.confidence] || CONF_COLORS.unknown;
-
-    const g = svg.append('g').attr('transform', `translate(${outputX},${y})`);
-
     g.append('rect')
-      .attr('width', COL_W).attr('height', NODE_H).attr('rx', 4)
-      .attr('fill', 'var(--bg-3)')
-      .attr('stroke', confColor)
-      .attr('stroke-width', 0.6)
-      .attr('stroke-opacity', 0.4);
+      .attr('x', rightX).attr('y', featY[i])
+      .attr('width', FEAT_NODE_W).attr('height', FEAT_H).attr('rx', 3)
+      .attr('fill', 'var(--bg-3)').attr('stroke', confColor)
+      .attr('stroke-width', 0.8).attr('stroke-opacity', 0.55);
 
-    // Activation bar
-    g.append('rect')
-      .attr('x', 4).attr('y', NODE_H - 3)
-      .attr('width', (COL_W - 8) * actRatio).attr('height', 2).attr('rx', 1)
-      .attr('fill', confColor).attr('opacity', 0.6);
+    g.append('title').text(feat.label);
 
     g.append('text')
-      .attr('x', 6).attr('y', NODE_H / 2 + 4)
+      .attr('x', rightX + 7).attr('y', featY[i] + FEAT_H / 2 + 4)
       .attr('fill', 'var(--text-1)')
-      .attr('font-family', 'IBM Plex Mono, monospace')
-      .attr('font-size', 9.5)
-      .text(feat.label.length > 13 ? feat.label.slice(0, 13) + '…' : feat.label);
+      .attr('font-family', 'IBM Plex Mono, monospace').attr('font-size', 9)
+      .text(feat.label);
+
+    g.on('click', (event) => {
+      event.stopPropagation();
+      highlightSVGLinks('target', i);
+    });
   });
 
   container.appendChild(svg.node());
+}
+
+// ── Detail panel ───────────────────────────────────────────────────────────────
+function clearDetail() {
+  const el = document.getElementById('explore-detail');
+  if (el) { el.innerHTML = ''; el.hidden = true; }
 }
 
 // ── Feature table ──────────────────────────────────────────────────────────────
@@ -215,32 +247,29 @@ function renderFeatureTable(features) {
     return;
   }
 
-  const rows = features.slice(0, 20).map((feat, i) => `
-    <tr class="explore-feat-row" data-feat-idx="${i}">
+  const rows = features.slice(0, TABLE_FEATS).map((feat, i) => `
+    <tr class="explore-feat-row" data-feat-idx="${i}" style="cursor:pointer">
       <td class="mono-cell">${i + 1}</td>
       <td class="mono-cell" style="color:var(--text-3)">#${feat.index}</td>
       <td class="feat-label-cell">${escapeHtml(feat.label)}</td>
       <td><span class="conf-badge ${feat.confidence}">${feat.confidence}</span></td>
       <td class="mono-cell" style="color:var(--text-1)">${feat.activation.toFixed(3)}</td>
-      <td class="mono-cell" style="color:var(--text-3)">${(feat.vocab_proj || []).slice(0,3).join(' · ')}</td>
     </tr>
   `).join('');
 
   container.innerHTML = `
     <table class="explore-table">
       <thead>
-        <tr>
-          <th>#</th>
-          <th>Idx</th>
-          <th>Label</th>
-          <th>Conf</th>
-          <th>Activation</th>
-          <th>Promotes</th>
-        </tr>
+        <tr><th>#</th><th>Idx</th><th>Label</th><th>Conf</th><th>Activation</th></tr>
       </thead>
       <tbody>${rows}</tbody>
     </table>
   `;
+
+  // Click table row to highlight SVG links for that feature
+  container.querySelectorAll('.explore-feat-row').forEach((row, i) => {
+    row.addEventListener('click', () => highlightSVGLinks('target', i));
+  });
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────────

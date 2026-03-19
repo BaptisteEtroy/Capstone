@@ -1,9 +1,9 @@
 /**
  * chat.js — Chat panel logic
- * Handles message submission, display, conversation history, and inline attribution.
+ * Handles message submission, streaming display, and wiring of attribution panels.
  */
 
-import { renderInlineAttribution } from './attribution.js';
+import { renderInputPanel, renderOutputPanel, renderHighlightedTokens, PALETTE } from './attribution.js';
 
 // ── State ──────────────────────────────────────────────────────────────────────
 let history = [];
@@ -11,14 +11,17 @@ let isLoading = false;
 
 // ── DOM refs ───────────────────────────────────────────────────────────────────
 let messagesEl, chatForm, inputEl, sendBtn, welcomeEl;
+let leftPanelEl, rightPanelEl;
 
 // ── Init ───────────────────────────────────────────────────────────────────────
 export function initChat(_appState) {
-  messagesEl = document.getElementById('messages');
-  chatForm   = document.getElementById('chat-form');
-  inputEl    = document.getElementById('chat-input');
-  sendBtn    = document.getElementById('send-btn');
-  welcomeEl  = document.getElementById('welcome');
+  messagesEl   = document.getElementById('messages');
+  chatForm     = document.getElementById('chat-form');
+  inputEl      = document.getElementById('chat-input');
+  sendBtn      = document.getElementById('send-btn');
+  welcomeEl    = document.getElementById('welcome');
+  leftPanelEl  = document.getElementById('attr-left-body');
+  rightPanelEl = document.getElementById('attr-right-body');
 
   inputEl.addEventListener('input', () => {
     inputEl.style.height = 'auto';
@@ -60,7 +63,9 @@ async function sendMessage(message) {
   inputEl.style.height = 'auto';
   sendBtn.disabled = true;
 
-  appendMessage('user', message);
+  setPanelsLoading();
+
+  const userMsgEl = appendMessage('user', message);
   scrollToBottom();
 
   const thinkingId = appendThinking();
@@ -98,7 +103,6 @@ async function sendMessage(message) {
         try { evt = JSON.parse(line.slice(6)); } catch { continue; }
 
         if (evt.type === 'log') {
-          // Only show log stages while thinking (before tokens arrive)
           if (!msgEl) updateThinkingStage(thinkingId, evt.text);
 
         } else if (evt.type === 'token') {
@@ -110,24 +114,52 @@ async function sendMessage(message) {
           updateMessageText(msgEl, responseText);
 
         } else if (evt.type === 'result') {
-          // Fallback: if no tokens streamed, render full response now
           if (!msgEl) {
             removeThinking(thinkingId);
             msgEl = appendMessage('assistant', evt.response || '');
             responseText = evt.response || '';
           }
           history.push({ role: 'assistant', content: responseText });
-          if ((evt.input_features?.length || evt.output_features?.length) && msgEl) {
-            renderInlineAttribution(msgEl, {
-              inputFeatures: evt.input_features || [],
-              outputFeatures: evt.output_features || [],
-            });
+
+          // Prioritise labeled features (confidence !== 'unknown') before unlabeled ones,
+          // preserving activation order within each group.
+          const inputFeatures  = prioritizeLabeled(evt.input_features  || []);
+          const outputFeatures = prioritizeLabeled(evt.output_features || []);
+
+          // Re-render user message with coloured token highlights
+          if (evt.input_tokens?.length && inputFeatures.length) {
+            const userBody = userMsgEl.querySelector('.message-body');
+            if (userBody) {
+              userBody.innerHTML = renderHighlightedTokens(
+                evt.input_tokens, inputFeatures, PALETTE
+              );
+            }
           }
+
+          // Re-render assistant response with coloured token highlights
+          if (evt.response_tokens?.length && outputFeatures.length) {
+            const body = msgEl.querySelector('.message-body');
+            if (body) {
+              const SKIP = new Set(['<|eot_id|>', '<|end_of_text|>', '<|begin_of_text|>']);
+              const cleanTokens = evt.response_tokens.map(t =>
+                t && !SKIP.has(t.trim()) ? t : ''
+              );
+              body.innerHTML = renderHighlightedTokens(
+                cleanTokens, outputFeatures, PALETTE
+              );
+            }
+          }
+
+          // Render side panels
+          renderInputPanel(leftPanelEl, { inputFeatures });
+          renderOutputPanel(rightPanelEl, { outputFeatures });
+
 
         } else if (evt.type === 'error') {
           removeThinking(thinkingId);
           appendError(evt.text || 'Generation failed');
           history.pop();
+          setPanelsEmpty();
         }
       }
       scrollToBottom();
@@ -137,6 +169,7 @@ async function sendMessage(message) {
     removeThinking(thinkingId);
     if (!msgEl) appendError(err.message || 'Request failed. Is the model loaded?');
     history.pop();
+    setPanelsEmpty();
   } finally {
     isLoading = false;
     sendBtn.disabled = !inputEl.value.trim();
@@ -144,29 +177,26 @@ async function sendMessage(message) {
   }
 }
 
+// ── Panel helpers ──────────────────────────────────────────────────────────────
+function setPanelsLoading() {
+  if (leftPanelEl)  leftPanelEl.innerHTML  = '';
+  if (rightPanelEl) rightPanelEl.innerHTML = '';
+}
+
+function setPanelsEmpty() {
+  if (leftPanelEl)  leftPanelEl.innerHTML  = '';
+  if (rightPanelEl) rightPanelEl.innerHTML = '';
+}
+
 // ── Message rendering ──────────────────────────────────────────────────────────
 function appendMessage(role, content) {
   const el = document.createElement('div');
   el.className = `message ${role}`;
   el.setAttribute('role', 'listitem');
-
-  if (role === 'assistant') {
-    el.innerHTML = `
-      <div class="message-role assistant-role">Assistant</div>
-      <div class="message-inner">
-        <div class="message-main">
-          <div class="message-body">${escapeHtml(content)}</div>
-        </div>
-        <div class="message-attr"></div>
-      </div>
-    `;
-  } else {
-    el.innerHTML = `
-      <div class="message-role user-role">You</div>
-      <div class="message-body">${escapeHtml(content)}</div>
-    `;
-  }
-
+  el.innerHTML = `
+    <div class="message-role">${role === 'assistant' ? 'Assistant' : 'You'}</div>
+    <div class="message-body">${escapeHtml(content)}</div>
+  `;
   messagesEl.appendChild(el);
   return el;
 }
@@ -182,12 +212,8 @@ function appendThinking() {
   el.className = 'message assistant';
   el.id = id;
   el.innerHTML = `
-    <div class="message-role assistant-role">Assistant</div>
-    <div class="message-inner">
-      <div class="message-main">
-        <div class="thinking-stages" id="${id}-stages"></div>
-      </div>
-    </div>
+    <div class="message-role">Assistant</div>
+    <div class="thinking-stages" id="${id}-stages"></div>
   `;
   messagesEl.appendChild(el);
   scrollToBottom();
@@ -215,8 +241,8 @@ function appendError(msg) {
   const el = document.createElement('div');
   el.className = 'message assistant';
   el.innerHTML = `
-    <div class="message-role assistant-role">Error</div>
-    <div class="message-body" style="border-color: rgba(255,255,255,0.1); color: var(--text-2);">${escapeHtml(msg)}</div>
+    <div class="message-role">Error</div>
+    <div class="message-body" style="color: var(--text-2);">${escapeHtml(msg)}</div>
   `;
   messagesEl.appendChild(el);
 }
@@ -234,4 +260,12 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/\n/g, '<br>');
+}
+
+// Labeled features (confidence !== 'unknown') float to the top;
+// activation order is preserved within each group.
+function prioritizeLabeled(features) {
+  const labeled   = features.filter(f => f.confidence !== 'unknown');
+  const unlabeled = features.filter(f => f.confidence === 'unknown');
+  return [...labeled, ...unlabeled];
 }

@@ -18,6 +18,15 @@ export function initSteering(appState) {
   const tokensEl    = document.getElementById('steer-tokens');
   const tokensValEl = document.getElementById('steer-tokens-val');
 
+  // Suggested feature quick-add chips
+  document.querySelectorAll('.steer-suggest-chip[data-feat-idx]').forEach(chip => {
+    chip.addEventListener('click', () => addFeature({
+      index:      parseInt(chip.dataset.featIdx),
+      label:      chip.dataset.featLabel,
+      confidence: chip.dataset.featConf,
+    }));
+  });
+
   // Tokens slider
   tokensEl?.addEventListener('input', () => {
     if (tokensValEl) tokensValEl.textContent = tokensEl.value;
@@ -69,8 +78,8 @@ export function initSteering(appState) {
         max_tokens: parseInt(tokensEl?.value || '150', 10),
       });
 
-      if (baselineEl) baselineEl.textContent = stripPrompt(data.baseline, prompt);
-      if (steeredEl)  steeredEl.textContent  = stripPrompt(data.steered, prompt);
+      if (baselineEl) baselineEl.textContent = stripPrompt(data.baseline);
+      if (steeredEl)  steeredEl.textContent  = stripPrompt(data.steered);
 
       if (badgeEl && data.applied_features?.length) {
         badgeEl.textContent = data.applied_features.map(f => f.label).join(' · ');
@@ -142,7 +151,7 @@ function addFeature(feat) {
   if (searchEl) searchEl.value = '';
 
   if (activeFeatures.has(feat.index)) return; // already added
-  activeFeatures.set(feat.index, 10);          // default strength
+  activeFeatures.set(feat.index, 5);           // default strength
 
   renderActiveFeatures();
 }
@@ -217,16 +226,7 @@ async function fetchFeatureLabel(idx) {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
-function stripPrompt(text, prompt) {
-  // Remove the echoed prompt prefix from decoded output
-  if (text.startsWith(prompt)) {
-    return text.slice(prompt.length).trim();
-  }
-  // Sometimes the model prepends "User: ..." — strip it
-  const idx = text.indexOf('Assistant:');
-  if (idx !== -1) {
-    return text.slice(idx + 10).trim();
-  }
+function stripPrompt(text) {
   return text.trim();
 }
 
