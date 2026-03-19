@@ -40,17 +40,25 @@ export function initExplore(appState) {
       runBtn?.click();
     }
   });
+
+  // Example chips
+  document.querySelectorAll('.explore-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      if (textEl) textEl.value = chip.dataset.prompt;
+      runBtn?.click();
+    });
+  });
 }
 
 // ── Render results ─────────────────────────────────────────────────────────────
 function renderResults({ tokens, features, links }) {
   renderTokens(tokens, features, links);
-  renderCircuit(tokens, features, links);
+  renderSankey(tokens, features, links);
   renderFeatureTable(features);
 }
 
 // ── Token display ──────────────────────────────────────────────────────────────
-function renderTokens(tokens, features, links) {
+function renderTokens(tokens, _features, links) {
   const el = document.getElementById('explore-tokens');
   if (!el) return;
   el.innerHTML = '';
@@ -61,7 +69,6 @@ function renderTokens(tokens, features, links) {
     badge.textContent = tok;
     badge.title = `Token ${i}`;
 
-    // Highlight tokens that have strong links
     const strength = links.filter(l => l.source === i).reduce((s, l) => s + l.value, 0);
     if (strength > 1) {
       badge.style.borderColor = 'rgba(255,255,255,0.18)';
@@ -70,7 +77,6 @@ function renderTokens(tokens, features, links) {
 
     badge.addEventListener('mouseenter', () => highlightLinksForToken(i, links));
     badge.addEventListener('mouseleave', () => resetHighlights());
-
     el.appendChild(badge);
   });
 }
@@ -78,8 +84,7 @@ function renderTokens(tokens, features, links) {
 function highlightLinksForToken(tokenIdx, links) {
   const active = new Set(links.filter(l => l.source === tokenIdx).map(l => l.target));
   document.querySelectorAll('.explore-feat-row').forEach(row => {
-    const featI = parseInt(row.dataset.featIdx);
-    row.classList.toggle('highlighted', active.has(featI));
+    row.classList.toggle('highlighted', active.has(parseInt(row.dataset.featIdx)));
   });
 }
 
@@ -87,119 +92,132 @@ function resetHighlights() {
   document.querySelectorAll('.explore-feat-row').forEach(r => r.classList.remove('highlighted'));
 }
 
-// ── Circuit SVG ────────────────────────────────────────────────────────────────
-function renderCircuit(tokens, features, links) {
+// ── Sankey diagram ─────────────────────────────────────────────────────────────
+function renderSankey(tokens, features, links) {
   const container = document.getElementById('explore-circuit');
   if (!container) return;
   container.innerHTML = '';
-
   if (!features.length) return;
 
-  const W     = container.offsetWidth || 600;
-  const NODE_H = 32;
-  const GAP    = 6;
-  const COL_W  = 130;
-
+  const topTokens   = tokens.slice(0, 15);
   const topFeatures = features.slice(0, 15);
-  const topTokens   = tokens.slice(0, 20);
+  const validLinks  = links.filter(l => l.source < topTokens.length && l.target < topFeatures.length);
 
-  const totalRows = Math.max(topTokens.length, topFeatures.length);
-  const H = totalRows * (NODE_H + GAP) + 50;
+  const W       = container.offsetWidth || 700;
+  const NODE_W  = 148;
+  const NODE_GAP = 5;
+  const MIN_H   = 24;
+  const PAD_T   = 16;
 
-  const inputX   = 0;
-  const outputX  = W - COL_W;
-  const midX     = W / 2;
+  // Total outgoing flow per token
+  const tokenFlow = new Array(topTokens.length).fill(0);
+  validLinks.forEach(l => { tokenFlow[l.source] += l.value; });
+
+  // Feature height proportional to activation
+  const maxAct = Math.max(...topFeatures.map(f => f.activation), 1);
+  const featFlow = topFeatures.map(f => f.activation / maxAct);
+
+  function buildHeights(values, count) {
+    const total = values.reduce((a, b) => a + b, 0) || 1;
+    const base = count * (MIN_H + NODE_GAP);
+    return values.map(v => Math.max(MIN_H, (v / total) * base * 1.4));
+  }
+
+  const tokenH = buildHeights(tokenFlow, topTokens.length);
+  const featH  = buildHeights(featFlow, topFeatures.length);
+
+  const H = Math.max(
+    PAD_T + tokenH.reduce((a, b) => a + b, 0) + NODE_GAP * (topTokens.length - 1) + PAD_T,
+    PAD_T + featH.reduce((a, b) => a + b, 0) + NODE_GAP * (topFeatures.length - 1) + PAD_T
+  );
+
+  // Y positions
+  const tokenY = [], featY = [];
+  let y = PAD_T;
+  tokenH.forEach(h => { tokenY.push(y); y += h + NODE_GAP; });
+  y = PAD_T;
+  featH.forEach(h => { featY.push(y); y += h + NODE_GAP; });
+
+  const leftX  = 0;
+  const rightX = W - NODE_W;
 
   const svg = d3.create('svg')
-    .attr('viewBox', `0 0 ${W} ${H}`)
-    .attr('width', W)
-    .attr('height', H);
+    .attr('width', W).attr('height', H)
+    .attr('viewBox', `0 0 ${W} ${H}`);
 
-  // Headers
-  const hStyle = 'font-family:IBM Plex Mono,monospace;font-size:9px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;';
-  const headerY = 12;
+  // Link stacking offsets within each node
+  const tokOff  = new Array(topTokens.length).fill(0);
+  const featOff = new Array(topFeatures.length).fill(0);
 
-  svg.append('text').attr('x', inputX + COL_W / 2).attr('y', headerY)
-    .attr('text-anchor', 'middle').attr('fill', 'var(--text-3)').attr('style', hStyle).text('TOKENS');
+  // Sort links by value descending for cleaner layering
+  [...validLinks].sort((a, b) => b.value - a.value).forEach(link => {
+    const si = link.source, ti = link.target;
+    const tokTotal  = tokenFlow[si] || 1;
+    const featTotal = featFlow[ti] || 1;
+    const lh_tok  = Math.max(1.5, (link.value / tokTotal)  * tokenH[si]);
+    const lh_feat = Math.max(1.5, (link.value / featTotal) * featH[ti]);
 
-  svg.append('text').attr('x', outputX + COL_W / 2).attr('y', headerY)
-    .attr('text-anchor', 'middle').attr('fill', 'var(--text-3)').attr('style', hStyle).text('FEATURES');
+    const x0 = leftX + NODE_W;
+    const x1 = rightX;
+    const y0 = tokenY[si] + tokOff[si];
+    const y1 = featY[ti]  + featOff[ti];
+    tokOff[si]  += lh_tok;
+    featOff[ti] += lh_feat;
 
-  const startY = 24;
-
-  // Token y centres
-  const tokenY = topTokens.map((_, i) => startY + i * (NODE_H + GAP) + NODE_H / 2);
-  const featY  = topFeatures.map((_, i) => startY + i * (NODE_H + GAP) + NODE_H / 2);
-
-  // Find max activation for scaling
-  const maxAct = Math.max(...topFeatures.map(f => f.activation), 1);
-
-  // Draw links
-  const validLinks = links.filter(l => l.source < topTokens.length && l.target < topFeatures.length);
-  const maxVal = Math.max(...validLinks.map(l => l.value), 1);
-
-  validLinks.forEach(link => {
-    const x1 = inputX + COL_W + 8;
-    const x2 = outputX - 8;
-    const y1 = tokenY[link.source];
-    const y2 = featY[link.target];
-    const opacity = 0.08 + (link.value / maxVal) * 0.5;
-    const w = 0.5 + (link.value / maxVal) * 2;
+    const mx = x0 + (x1 - x0) * 0.55;
+    const d = [
+      `M ${x0} ${y0}`,
+      `C ${mx} ${y0}, ${mx} ${y1}, ${x1} ${y1}`,
+      `L ${x1} ${y1 + lh_feat}`,
+      `C ${mx} ${y1 + lh_feat}, ${mx} ${y0 + lh_tok}, ${x0} ${y0 + lh_tok}`,
+      'Z',
+    ].join(' ');
 
     svg.append('path')
-      .attr('d', `M${x1},${y1} C${midX},${y1} ${midX},${y2} ${x2},${y2}`)
-      .attr('fill', 'none')
-      .attr('stroke', '#6e6e78')
-      .attr('stroke-width', w)
-      .attr('stroke-opacity', 0)
-      .transition().delay((link.source + link.target) * 20).duration(200)
-      .attr('stroke-opacity', opacity);
+      .attr('d', d)
+      .attr('fill', 'rgba(152,152,180,0.18)')
+      .attr('stroke', 'rgba(152,152,180,0.08)')
+      .attr('stroke-width', 0.5)
+      .attr('opacity', 0)
+      .transition().duration(280).delay((si + ti) * 22)
+      .attr('opacity', 1);
   });
 
-  // Draw token nodes
+  // Token nodes
   topTokens.forEach((tok, i) => {
-    const y = startY + i * (NODE_H + GAP);
-    const g = svg.append('g').attr('transform', `translate(${inputX},${y})`);
-
+    const g = svg.append('g');
     g.append('rect')
-      .attr('width', COL_W).attr('height', NODE_H).attr('rx', 4)
-      .attr('fill', 'var(--bg-3)').attr('stroke', 'var(--border-default)').attr('stroke-width', 0.6);
+      .attr('x', leftX).attr('y', tokenY[i])
+      .attr('width', NODE_W).attr('height', tokenH[i]).attr('rx', 3)
+      .attr('fill', 'var(--bg-3)').attr('stroke', 'var(--border-2)').attr('stroke-width', 0.5);
 
-    g.append('text')
-      .attr('x', 8).attr('y', NODE_H / 2 + 4)
-      .attr('fill', 'var(--text-2)')
-      .attr('font-family', 'IBM Plex Mono, monospace')
-      .attr('font-size', 10)
-      .text(tok.length > 14 ? tok.slice(0, 14) + '…' : tok);
+    if (tokenH[i] >= 16) {
+      g.append('text')
+        .attr('x', leftX + 8).attr('y', tokenY[i] + tokenH[i] / 2 + 4)
+        .attr('fill', 'var(--text-2)')
+        .attr('font-family', 'IBM Plex Mono, monospace').attr('font-size', 10)
+        .text(tok.length > 18 ? tok.slice(0, 18) + '…' : tok);
+    }
   });
 
-  // Draw feature nodes
+  // Feature nodes
   topFeatures.forEach((feat, i) => {
-    const y = startY + i * (NODE_H + GAP);
-    const actRatio = feat.activation / maxAct;
+    const g = svg.append('g');
     const confColor = CONF_COLORS[feat.confidence] || CONF_COLORS.unknown;
-
-    const g = svg.append('g').attr('transform', `translate(${outputX},${y})`);
-
     g.append('rect')
-      .attr('width', COL_W).attr('height', NODE_H).attr('rx', 4)
-      .attr('fill', 'var(--bg-3)')
-      .attr('stroke', confColor)
-      .attr('stroke-width', 0.6)
-      .attr('stroke-opacity', 0.4);
+      .attr('x', rightX).attr('y', featY[i])
+      .attr('width', NODE_W).attr('height', featH[i]).attr('rx', 3)
+      .attr('fill', 'var(--bg-3)').attr('stroke', confColor)
+      .attr('stroke-width', 0.8).attr('stroke-opacity', 0.55);
 
-    // Activation bar
-    g.append('rect')
-      .attr('x', 4).attr('y', NODE_H - 3)
-      .attr('width', (COL_W - 8) * actRatio).attr('height', 2).attr('rx', 1)
-      .attr('fill', confColor).attr('opacity', 0.6);
-
-    g.append('text')
-      .attr('x', 6).attr('y', NODE_H / 2 + 4)
-      .attr('fill', 'var(--text-1)')
-      .attr('font-family', 'IBM Plex Mono, monospace')
-      .attr('font-size', 9.5)
-      .text(feat.label.length > 13 ? feat.label.slice(0, 13) + '…' : feat.label);
+    if (featH[i] >= 16) {
+      const label = feat.label.length > 15 ? feat.label.slice(0, 15) + '…' : feat.label;
+      g.append('text')
+        .attr('x', rightX + 6).attr('y', featY[i] + featH[i] / 2 + 4)
+        .attr('fill', 'var(--text-1)')
+        .attr('font-family', 'IBM Plex Mono, monospace').attr('font-size', 9)
+        .text(label);
+    }
   });
 
   container.appendChild(svg.node());
@@ -222,7 +240,6 @@ function renderFeatureTable(features) {
       <td class="feat-label-cell">${escapeHtml(feat.label)}</td>
       <td><span class="conf-badge ${feat.confidence}">${feat.confidence}</span></td>
       <td class="mono-cell" style="color:var(--text-1)">${feat.activation.toFixed(3)}</td>
-      <td class="mono-cell" style="color:var(--text-3)">${(feat.vocab_proj || []).slice(0,3).join(' · ')}</td>
     </tr>
   `).join('');
 
@@ -235,7 +252,6 @@ function renderFeatureTable(features) {
           <th>Label</th>
           <th>Conf</th>
           <th>Activation</th>
-          <th>Promotes</th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>

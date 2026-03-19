@@ -11,7 +11,7 @@ let isLoading = false;
 
 // ── DOM refs ───────────────────────────────────────────────────────────────────
 let messagesEl, chatForm, inputEl, sendBtn, welcomeEl;
-let leftPanelEl, rightPanelEl, leftCountEl, rightCountEl;
+let leftPanelEl, rightPanelEl;
 
 // ── Init ───────────────────────────────────────────────────────────────────────
 export function initChat(_appState) {
@@ -22,8 +22,6 @@ export function initChat(_appState) {
   welcomeEl    = document.getElementById('welcome');
   leftPanelEl  = document.getElementById('attr-left-body');
   rightPanelEl = document.getElementById('attr-right-body');
-  leftCountEl  = document.getElementById('attr-left-count');
-  rightCountEl = document.getElementById('attr-right-count');
 
   inputEl.addEventListener('input', () => {
     inputEl.style.height = 'auto';
@@ -151,10 +149,6 @@ async function sendMessage(message) {
           renderInputPanel(leftPanelEl, { inputFeatures: evt.input_features || [] });
           renderOutputPanel(rightPanelEl, { outputFeatures: evt.output_features || [] });
 
-          const inN  = (evt.input_features  || []).length;
-          const outN = (evt.output_features || []).length;
-          if (leftCountEl)  leftCountEl.textContent  = `${inN} feature${inN  !== 1 ? 's' : ''}`;
-          if (rightCountEl) rightCountEl.textContent = `${outN} feature${outN !== 1 ? 's' : ''}`;
 
         } else if (evt.type === 'error') {
           removeThinking(thinkingId);
@@ -180,16 +174,13 @@ async function sendMessage(message) {
 
 // ── Panel helpers ──────────────────────────────────────────────────────────────
 function setPanelsLoading() {
-  const html = '<div class="attr-computing"><div class="attr-computing-dot"></div>Computing…</div>';
-  if (leftPanelEl)  leftPanelEl.innerHTML  = html;
-  if (rightPanelEl) rightPanelEl.innerHTML = html;
-  if (leftCountEl)  leftCountEl.textContent  = 'Query features';
-  if (rightCountEl) rightCountEl.textContent = 'Response features';
+  if (leftPanelEl)  leftPanelEl.innerHTML  = '';
+  if (rightPanelEl) rightPanelEl.innerHTML = '';
 }
 
 function setPanelsEmpty() {
-  if (leftPanelEl)  leftPanelEl.innerHTML  = '<div class="attr-empty">No features computed</div>';
-  if (rightPanelEl) rightPanelEl.innerHTML = '<div class="attr-empty">No features computed</div>';
+  if (leftPanelEl)  leftPanelEl.innerHTML  = '';
+  if (rightPanelEl) rightPanelEl.innerHTML = '';
 }
 
 // ── Message rendering ──────────────────────────────────────────────────────────

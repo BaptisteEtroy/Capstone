@@ -74,6 +74,13 @@ class ServerState:
                 with open(features_path) as f:
                     all_feats = json.load(f)
                 self.feature_by_index = {feat["index"]: feat for feat in all_feats}
+                label_map = {f["index"]: f for f in self.labeled_features}
+                for feat in all_feats:
+                    if feat["index"] in label_map:
+                        lbl = label_map[feat["index"]]
+                        self.feature_by_index[feat["index"]]["label"] = lbl.get("label", "")
+                        self.feature_by_index[feat["index"]]["confidence"] = lbl.get("confidence", "low")
+                        self.feature_by_index[feat["index"]]["reasoning"] = lbl.get("reasoning", "")
             self.loaded = True
             print(f"Ready — {len(self.labeled_features)} labeled features")
         except Exception as e:
@@ -252,16 +259,9 @@ def _top_features_full(
 
 
 def _build_prompt(message: str, history: List[Dict[str, str]]) -> str:
-    prompt = ""
-    for turn in (history or []):
-        role = turn.get("role", "user")
-        content = turn.get("content", "")
-        if role == "user":
-            prompt += f"User: {content}\nAssistant: "
-        else:
-            prompt += f"{content}\n"
-    prompt += f"User: {message}\nAssistant:"
-    return prompt
+    messages = [{"role": t.get("role", "user"), "content": t.get("content", "")} for t in (history or [])]
+    messages.append({"role": "user", "content": message})
+    return srv.model.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
 # =============================================================================
@@ -388,7 +388,9 @@ async def steer(req: SteerRequest):
 
     try:
         features = {int(k): v for k, v in req.features.items()}
-        baseline_text, steered_text = _do_steer(req.prompt, features, req.max_tokens)
+        messages = [{"role": "user", "content": req.prompt}]
+        prompt = srv.model.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        baseline_text, steered_text = _do_steer(prompt, features, req.max_tokens)
 
         feature_labels = []
         for idx, strength in features.items():
@@ -415,41 +417,43 @@ def _do_steer(prompt: str, feature_strengths: Dict[int, float], max_tokens: int)
 
     hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
     tokens_orig = srv.model.to_tokens(prompt)
+    input_len = tokens_orig.shape[1]
 
     with torch.no_grad():
         output_orig = srv.model.generate(
-            tokens_orig, max_new_tokens=max_tokens, do_sample=True, temperature=0.8, top_p=0.9,
+            tokens_orig, max_new_tokens=max_tokens, do_sample=True, temperature=0.7, top_p=0.9,
         )
-    text_orig = srv.model.tokenizer.decode(output_orig[0])
+    text_orig = srv.model.tokenizer.decode(output_orig[0][input_len:], skip_special_tokens=True)
 
     if steering_vector.abs().sum() < 0.1:
         return text_orig, text_orig
 
     with torch.no_grad():
-        _, cache = srv.model.run_with_cache(srv.model.to_tokens(prompt))
+        _, cache = srv.model.run_with_cache(tokens_orig)
         resid_norm = cache[hook_point][0].norm(dim=-1).mean().item()
 
     steer_unit = steer_direction / (steer_direction.norm() + 1e-8)
     total_strength = steering_vector.abs().max().item()
-    scaled_steer = steer_unit * total_strength * resid_norm * 0.1
+    scaled_steer = steer_unit * total_strength * resid_norm * 0.05
 
     def steering_hook(activation, hook):
         activation[:, :, :] += scaled_steer.unsqueeze(0).unsqueeze(0)
         return activation
 
     tokens = srv.model.to_tokens(prompt)
+    steer_input_len = tokens.shape[1]
     with torch.no_grad():
         for _ in range(max_tokens):
             srv.model.add_hook(hook_point, steering_hook)
             logits = srv.model(tokens)[:, -1, :]
             srv.model.reset_hooks()
-            probs = torch.softmax(logits / 0.8, dim=-1)
+            probs = torch.softmax(logits / 0.7, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             tokens = torch.cat([tokens, next_token], dim=1)
             if next_token.item() == srv.model.tokenizer.eos_token_id:
                 break
 
-    text_steer = srv.model.tokenizer.decode(tokens[0])
+    text_steer = srv.model.tokenizer.decode(tokens[0][steer_input_len:], skip_special_tokens=True)
     return text_orig, text_steer
 
 

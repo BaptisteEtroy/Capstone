@@ -133,12 +133,7 @@
 
         <!-- Left: input attribution -->
         <aside id="attr-left" class="attr-panel" aria-label="Input feature attribution">
-          <div class="attr-panel-hd">
-            <span class="attr-panel-title">Input</span>
-            <span class="attr-panel-sub" id="attr-left-count">Query features</span>
-          </div>
           <div id="attr-left-body" class="attr-panel-body">
-            <div class="attr-empty">Send a message to see which SAE features your query activates</div>
           </div>
         </aside>
 
@@ -151,10 +146,10 @@
               <h2 class="welcome-title">SAE Interpretability Lab</h2>
               <p class="welcome-sub">Ask a question and observe which sparse autoencoder features activate — tracing how the model maps inputs to outputs through learned representations.</p>
               <div class="example-chips" role="list" aria-label="Example prompts">
-                <button class="example-chip" role="listitem" data-prompt="What are the main symptoms of myocardial infarction?">Myocardial infarction</button>
-                <button class="example-chip" role="listitem" data-prompt="How do beta-blockers lower blood pressure?">Beta-blocker mechanism</button>
-                <button class="example-chip" role="listitem" data-prompt="What is the difference between type 1 and type 2 diabetes?">Type 1 vs Type 2 diabetes</button>
-                <button class="example-chip" role="listitem" data-prompt="Explain the blood-brain barrier.">Blood-brain barrier</button>
+                <button class="example-chip" role="listitem" data-prompt="What are the symptoms and diagnostic criteria for major depressive disorder?">Major depressive disorder</button>
+                <button class="example-chip" role="listitem" data-prompt="How do statins reduce cardiovascular risk and what are their side effects?">Statins &amp; cardiovascular risk</button>
+                <button class="example-chip" role="listitem" data-prompt="How does cancer develop resistance to chemotherapy drugs?">Chemotherapy resistance</button>
+                <button class="example-chip" role="listitem" data-prompt="What factors predict mortality in sepsis patients and how is it diagnosed?">Sepsis mortality predictors</button>
               </div>
             </div>
           </div>
@@ -193,12 +188,7 @@
 
         <!-- Right: output attribution -->
         <aside id="attr-right" class="attr-panel" aria-label="Output feature attribution">
-          <div class="attr-panel-hd">
-            <span class="attr-panel-title">Output</span>
-            <span class="attr-panel-sub" id="attr-right-count">Response features</span>
-          </div>
           <div id="attr-right-body" class="attr-panel-body">
-            <div class="attr-empty">Send a message to see which features shaped the response</div>
           </div>
         </aside>
 
@@ -224,6 +214,16 @@
           <div class="form-block">
             <label class="form-label" for="steer-prompt">Prompt</label>
             <textarea id="steer-prompt" class="form-textarea" rows="4" placeholder="Enter a prompt…"></textarea>
+          </div>
+
+          <div class="form-block">
+            <label class="form-label">Quick add</label>
+            <div class="steer-suggestions">
+              <button class="steer-suggest-chip" data-feat-idx="7257" data-feat-label="Lipid-lowering therapy and cardiovascular risk reduction" data-feat-conf="medium">Cardiovascular risk</button>
+              <button class="steer-suggest-chip" data-feat-idx="3072" data-feat-label="Psychiatric and behavioral symptom descriptors" data-feat-conf="high">Psychiatric symptoms</button>
+              <button class="steer-suggest-chip" data-feat-idx="7837" data-feat-label="Patient mortality and death outcomes" data-feat-conf="medium">Mortality outcomes</button>
+              <button class="steer-suggest-chip" data-feat-idx="7398" data-feat-label="Drug/treatment resistance circumvention in oncology" data-feat-conf="medium">Chemo resistance</button>
+            </div>
           </div>
 
           <div class="form-block">
@@ -306,6 +306,11 @@
               </svg>
               Analyse
             </button>
+          </div>
+          <div class="explore-suggestions">
+            <button class="steer-suggest-chip explore-chip" data-prompt="Aspirin inhibits platelet aggregation by blocking COX-1.">Aspirin &amp; platelets</button>
+            <button class="steer-suggest-chip explore-chip" data-prompt="Chronic alcohol consumption causes hepatocyte damage and liver fibrosis.">Alcohol liver damage</button>
+            <button class="steer-suggest-chip explore-chip" data-prompt="Beta-blockers reduce mortality in heart failure patients.">Beta-blockers in HF</button>
           </div>
         </div>
 

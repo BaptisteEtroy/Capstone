@@ -307,38 +307,12 @@ a { color: var(--text-2); text-decoration: underline; text-underline-offset: 2px
   flex-direction: column;
   height: 100vh;
   overflow: hidden;
-  border-right: 1px solid var(--border-1);
-}
-#attr-right.attr-panel { border-right: none; border-left: 1px solid var(--border-1); }
-
-.attr-panel-hd {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 14px var(--sp-4) var(--sp-3);
-  border-bottom: 1px solid var(--border-1);
-  flex-shrink: 0;
-}
-
-.attr-panel-title {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  font-weight: 500;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--text-2);
-}
-
-.attr-panel-sub {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  color: var(--text-3);
 }
 
 .attr-panel-body {
   flex: 1;
   overflow-y: auto;
-  padding: var(--sp-3) var(--sp-3);
+  padding: 60px var(--sp-4) var(--sp-3);
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
@@ -493,6 +467,9 @@ a { color: var(--text-2); text-decoration: underline; text-underline-offset: 2px
   display: flex;
   flex-direction: column;
   gap: 0;
+  max-height: 260px;
+  overflow-y: auto;
+  scrollbar-width: thin;
 }
 
 .out-example {
@@ -705,7 +682,7 @@ mark.ctx-mark {
   display: flex;
   flex-direction: column;
   gap: var(--sp-5);
-  padding: var(--sp-8);
+  padding: 60px var(--sp-8) var(--sp-8);
   border-right: 1px solid var(--border-1);
   overflow-y: auto;
   scrollbar-width: thin;
@@ -758,6 +735,20 @@ mark.ctx-mark {
 .form-textarea::placeholder { color: var(--text-3); }
 
 .steer-active-list { display: flex; flex-direction: column; gap: var(--sp-1); min-height: 40px; }
+
+.steer-suggestions { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.steer-suggest-chip {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  padding: 3px 10px;
+  background: var(--bg-3);
+  border: 1px solid var(--border-2);
+  border-radius: 20px;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: background 120ms, color 120ms, border-color 120ms;
+}
+.steer-suggest-chip:hover { background: var(--bg-4); color: var(--text-1); border-color: var(--border-3); }
 
 .steer-empty-hint {
   display: flex;
@@ -974,11 +965,12 @@ mark.ctx-mark {
   flex-direction: column;
   height: 100vh;
   overflow: hidden;
-  padding: var(--sp-8);
+  padding: 60px var(--sp-8) var(--sp-8);
   gap: var(--sp-5);
 }
 
 .explore-input-block { display: flex; flex-direction: column; gap: var(--sp-3); flex-shrink: 0; }
+.explore-suggestions { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
 .explore-input-row { display: flex; gap: var(--sp-3); align-items: flex-start; }
 .explore-textarea { flex: 1; }
 
@@ -1064,7 +1056,7 @@ mark.ctx-mark {
   flex-direction: column;
   height: 100vh;
   overflow: hidden;
-  padding: var(--sp-8);
+  padding: 60px var(--sp-8) var(--sp-8);
   gap: var(--sp-5);
 }
 
