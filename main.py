@@ -9,6 +9,7 @@ Usage:
 """
 
 import torch
+import torch.nn.functional as F
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from pathlib import Path
@@ -61,9 +62,10 @@ def collect_activations(
     max_tokens: int = 128,
     chunk_size: int = 10_000,
     output_dir: Path = MEDICAL_OUTPUT_DIR,
+    layer: int = TARGET_LAYER,
 ) -> tuple:
     """
-    Collect residual stream activations from layer TARGET_LAYER using medical datasets.
+    Collect residual stream activations from the given layer using medical datasets.
 
     Saves activation chunks to disk to stay within RAM limits.
     Token IDs and source IDs are kept in memory (small) for MaxAct context building.
@@ -76,10 +78,10 @@ def collect_activations(
     """
     import gc
 
-    hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
+    hook_point = f"blocks.{layer}.hook_{HOOK_TYPE}"
     chunks_dir = output_dir / "chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\nCollecting activations from {hook_point}...")
+    print(f"\nCollecting activations from {hook_point} (layer {layer})...")
     print(f"  Dataset: medmcqa + pubmed_qa + pubmed_abs (instruction-formatted) | Samples: {num_samples}")
 
     all_activations = []
@@ -230,8 +232,14 @@ def train_sae(
     optimizer = Adam(sae.parameters(), lr=learning_rate)
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=learning_rate * 0.1)
 
-    history = {"loss": [], "reconstruction": []}
+    history = {"loss": [], "reconstruction": [], "dead_features_per_epoch": [], "epoch_losses": []}
     global_step = 0
+
+    # EMA of per-feature firing rate — tracks which features are alive over time.
+    # alpha=0.99: slow decay so the estimate reflects hundreds of batches, not just the last one.
+    # A feature is "dead" when its EMA drops below 1e-5 (fires < 0.001% of tokens on average).
+    EMA_ALPHA = 0.99
+    ema_freq = torch.zeros(sae.d_hidden, device=device)
 
     for epoch in range(num_epochs):
         epoch_loss = 0.0
@@ -258,6 +266,11 @@ def train_sae(
                 scheduler.step()
                 sae._normalize_decoder()
 
+                # Update EMA firing rate: fraction of tokens in this batch that fired each feature
+                with torch.no_grad():
+                    batch_freq = (output.hidden > 0).float().mean(dim=0)
+                    ema_freq = EMA_ALPHA * ema_freq + (1 - EMA_ALPHA) * batch_freq
+
                 epoch_loss += output.loss.item()
                 epoch_steps += 1
                 global_step += 1
@@ -271,7 +284,11 @@ def train_sae(
             del activations, dataset, loader
             gc.collect()
 
-        print(f"  Epoch {epoch+1} avg loss: {epoch_loss / epoch_steps:.4f}")
+        # End-of-epoch metrics
+        epoch_dead = int((ema_freq < 1e-5).sum().item())
+        history["dead_features_per_epoch"].append(epoch_dead)
+        history["epoch_losses"].append(epoch_loss / epoch_steps)
+        print(f"  Epoch {epoch+1} avg loss: {epoch_loss / epoch_steps:.4f}  |  dead features (EMA): {epoch_dead}/{sae.d_hidden}")
 
     print(f"\nTraining complete!")
     return history
@@ -603,6 +620,7 @@ def save_results(
     output_dir: Path = MEDICAL_OUTPUT_DIR,
     source_ids: Optional[torch.Tensor] = None,
     source_list: Optional[List[str]] = None,
+    layer: int = TARGET_LAYER,
 ):
     """Save all results to disk. Processes chunks one at a time — no OOM."""
     import gc
@@ -636,6 +654,12 @@ def save_results(
     n_tokens = 0
     feature_count = torch.zeros(sae.d_hidden)
     total_l0 = 0.0
+    # Explained variance accumulators (single-pass via E[x²] - E[x]²).
+    # Summed over tokens, averaged at the end.  All in float64 to avoid
+    # catastrophic cancellation when subtracting two large numbers.
+    sum_x   = torch.zeros(sae.d_model, dtype=torch.float64)
+    sum_x2  = torch.zeros(sae.d_model, dtype=torch.float64)
+    sum_res2 = 0.0   # sum of ||x - x̂||² over all tokens
 
     print("  Computing summary statistics (chunked)...")
     for chunk_path in tqdm(chunk_files, desc="  Stats"):
@@ -643,16 +667,32 @@ def save_results(
         for i in range(0, len(chunk), BATCH_SIZE):
             batch = chunk[i:i+BATCH_SIZE].to(device)
             with torch.no_grad():
-                features = sae.encode(batch).cpu()
+                features = sae.encode(batch)
+                recon    = sae.decode(features)
+                residual = batch - recon
+            features = features.cpu()
             feature_count += (features > 0).float().sum(dim=0)
             total_l0 += (features > 0).float().sum(dim=-1).sum().item()
-            n_tokens += features.shape[0]
+            n_tokens += batch.shape[0]
+            # Accumulate for explained variance
+            b = batch.double().cpu()
+            sum_x   += b.sum(dim=0)
+            sum_x2  += (b ** 2).sum(dim=0)
+            sum_res2 += residual.double().pow(2).sum().item()
         del chunk
         gc.collect()
 
     feature_freq = feature_count / n_tokens
     dead_features = (feature_freq < 1e-5).sum().item()
     avg_l0 = total_l0 / n_tokens
+
+    # Explained variance = 1 - Var(residual) / Var(x)
+    # Var(x) per dimension = E[x²] - E[x]²; total = sum over dimensions
+    mean_x      = sum_x / n_tokens
+    var_x_total = float((sum_x2 / n_tokens - mean_x ** 2).sum().item())
+    var_res     = sum_res2 / n_tokens          # mean per-token residual variance
+    explained_variance = 1.0 - (var_res / var_x_total) if var_x_total > 0 else 0.0
+    explained_variance = round(float(explained_variance), 6)
     
     # Save feature analysis with both MaxAct and VocabProj
     features_data = [
@@ -691,7 +731,7 @@ def save_results(
     
     summary = {
         "model": MODEL_NAME,
-        "layer": TARGET_LAYER,
+        "layer": layer,
         "hook_type": HOOK_TYPE,
         "d_model": D_MODEL,
         "d_hidden": sae.d_hidden,
@@ -699,6 +739,7 @@ def save_results(
         "n_chunks": len(chunk_files),
         "dead_features": dead_features,
         "avg_l0_sparsity": avg_l0,
+        "explained_variance": explained_variance,
         "final_loss": history["loss"][-1] if history["loss"] else None,
         "analysis_methods": ["MaxAct (input-centric)", "VocabProj (output-centric)"],
     }
@@ -709,12 +750,142 @@ def save_results(
     print(f"  Results Summary")
     print(f"{'='*60}")
     print(f"  Model: {MODEL_NAME}")
-    print(f"  Layer: {TARGET_LAYER} ({HOOK_TYPE})")
+    print(f"  Layer: {layer} ({HOOK_TYPE})")
     print(f"  Tokens: {n_tokens:,} ({len(chunk_files)} chunks on disk)")
     print(f"  Features: {sae.d_hidden:,}")
     print(f"  Dead features: {dead_features}")
     print(f"  Avg L0 sparsity: {avg_l0:.1f}")
+    print(f"  Explained variance: {explained_variance:.4f}")
     print(f"{'='*60}")
+
+
+# =============================================================================
+# Cross-Layer Analysis
+# =============================================================================
+
+def cross_layer_analysis(layer_dirs: Dict[int, Path]):
+    """
+    Compare decoder weight directions across layers to quantify feature evolution.
+
+    For each pair of trained layers, computes the distribution of maximum cosine
+    similarities between decoder feature directions.  High similarity = the same
+    concept is represented in both layers; low = a layer-specific specialisation.
+
+    Saves medical_outputs/cross_layer_analysis.json with:
+      - per-pair statistics (mean/median max-sim, shared-feature counts)
+      - similarity histograms for plotting
+      - top shared features (cosine sim > 0.7) with their indices in each layer
+    """
+    from itertools import combinations
+
+    print(f"\n{'='*60}")
+    print("  Cross-Layer Feature Analysis")
+    print(f"  Layers: {sorted(layer_dirs)}")
+    print(f"{'='*60}")
+
+    # Load all available SAEs
+    saes: Dict[int, SparseAutoencoder] = {}
+    for layer, layer_dir in sorted(layer_dirs.items()):
+        sae_path = layer_dir / "sae.pt"
+        if not sae_path.exists():
+            print(f"  WARNING: No SAE at {sae_path} — skipping layer {layer}.")
+            continue
+        sae = SparseAutoencoder.load(sae_path)
+        sae.eval()
+        saes[layer] = sae
+        print(f"  Loaded layer {layer}: {sae.d_hidden} features")
+
+    if len(saes) < 2:
+        print("  Need at least 2 trained layers for cross-layer analysis. Skipping.")
+        return
+
+    HIGH_SIM_THRESHOLD = 0.7
+    CHUNK = 512   # rows per matmul chunk — keeps memory bounded
+    BIN_EDGES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+    results: Dict = {"layers": sorted(saes.keys()), "pairs": {}}
+
+    for layer_a, layer_b in combinations(sorted(saes.keys()), 2):
+        sae_a = saes[layer_a]
+        sae_b = saes[layer_b]
+
+        # Decoder weight: [d_model, d_hidden].  Transpose → [d_hidden, d_model]
+        # so each ROW is one feature's direction in model space.
+        W_a = F.normalize(sae_a.decoder.weight.T.float(), dim=-1)  # [n_feat, d_model]
+        W_b = F.normalize(sae_b.decoder.weight.T.float(), dim=-1)
+
+        print(f"\n  L{layer_a} → L{layer_b} "
+              f"({W_a.shape[0]} × {W_b.shape[0]} features) …")
+
+        def _best_matches(src: torch.Tensor, tgt: torch.Tensor):
+            """For each row in src, find max cosine sim to any row in tgt."""
+            max_sims, max_idxs = [], []
+            for i in range(0, src.shape[0], CHUNK):
+                block = src[i:i + CHUNK]          # [chunk, d_model]
+                sim = block @ tgt.T               # [chunk, n_tgt]
+                ms, mi = sim.max(dim=-1)
+                max_sims.extend(ms.tolist())
+                max_idxs.extend(mi.tolist())
+            return torch.tensor(max_sims), max_idxs
+
+        sims_a2b, idx_a2b = _best_matches(W_a, W_b)
+        sims_b2a, _       = _best_matches(W_b, W_a)
+
+        def _histogram(sims: torch.Tensor):
+            counts = []
+            for lo, hi in zip(BIN_EDGES[:-1], BIN_EDGES[1:]):
+                hi_ = hi + 0.01 if hi == 1.0 else hi   # include 1.0 in last bin
+                counts.append(int(((sims >= lo) & (sims < hi_)).sum().item()))
+            return {"bins": BIN_EDGES, "counts": counts}
+
+        shared_a2b_mask = sims_a2b > HIGH_SIM_THRESHOLD
+        shared_count_a2b = int(shared_a2b_mask.sum().item())
+        shared_count_b2a = int((sims_b2a > HIGH_SIM_THRESHOLD).sum().item())
+
+        # Collect top shared feature pairs (idx_in_A, idx_in_B, similarity)
+        shared_pairs = []
+        if shared_count_a2b > 0:
+            shared_indices_a = shared_a2b_mask.nonzero(as_tuple=True)[0].tolist()
+            for idx_a in sorted(shared_indices_a, key=lambda i: -sims_a2b[i].item())[:50]:
+                shared_pairs.append({
+                    "layer_a_feature": int(idx_a),
+                    "layer_b_feature": int(idx_a2b[idx_a]),
+                    "cosine_similarity": round(float(sims_a2b[idx_a].item()), 4),
+                })
+
+        pair_key = f"{layer_a}_{layer_b}"
+        results["pairs"][pair_key] = {
+            "layer_a": layer_a,
+            "layer_b": layer_b,
+            "n_features_a": int(W_a.shape[0]),
+            "n_features_b": int(W_b.shape[0]),
+            "similarity_threshold": HIGH_SIM_THRESHOLD,
+            "a_to_b": {
+                "mean_max_similarity":   round(float(sims_a2b.mean()), 4),
+                "median_max_similarity": round(float(sims_a2b.median()), 4),
+                "std_max_similarity":    round(float(sims_a2b.std()), 4),
+                "shared_features_count": shared_count_a2b,
+                "shared_features_pct":   round(shared_count_a2b / W_a.shape[0] * 100, 2),
+                "histogram": _histogram(sims_a2b),
+            },
+            "b_to_a": {
+                "mean_max_similarity":   round(float(sims_b2a.mean()), 4),
+                "median_max_similarity": round(float(sims_b2a.median()), 4),
+                "shared_features_count": shared_count_b2a,
+                "shared_features_pct":   round(shared_count_b2a / W_b.shape[0] * 100, 2),
+            },
+            "top_shared_pairs": shared_pairs,
+        }
+
+        print(f"    mean_max_sim={results['pairs'][pair_key]['a_to_b']['mean_max_similarity']:.4f}  "
+              f"shared (>{HIGH_SIM_THRESHOLD}): "
+              f"{shared_count_a2b}/{W_a.shape[0]} "
+              f"({results['pairs'][pair_key]['a_to_b']['shared_features_pct']:.1f}%)")
+
+    out_path = MEDICAL_OUTPUT_DIR / "cross_layer_analysis.json"
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  Cross-layer analysis saved → {out_path}")
 
 
 # =============================================================================
@@ -726,77 +897,148 @@ def main():
     parser.add_argument("--quick", action="store_true", help="Quick test (500 samples, 1 epoch)")
     parser.add_argument("--skip-collection", action="store_true", help="Reuse cached activations")
     parser.add_argument("--device", type=str, default=None, help="Device override (auto-detected)")
+    parser.add_argument(
+        "--layers", nargs="+", type=int, default=[TARGET_LAYER],
+        help=(
+            "One or more residual-stream layers to train SAEs on "
+            "(default: [8]).  E.g. --layers 4 8 12.  "
+            "When more than one layer is given, cross_layer_analysis() is run "
+            "afterwards and the decoder cosine-similarity results are written to "
+            "medical_outputs/cross_layer_analysis.json."
+        ),
+    )
     args = parser.parse_args()
 
     device = args.device or get_device()
     num_samples = 500 if args.quick else NUM_SAMPLES
     num_epochs = 1 if args.quick else NUM_EPOCHS
-    output_dir = MEDICAL_OUTPUT_DIR
-    output_dir.mkdir(parents=True, exist_ok=True)
+    layers: List[int] = args.layers
+
+    # Per-layer output directory.
+    # Single-layer default (layer 8) → medical_outputs/  (backward-compatible).
+    # Any other configuration       → medical_outputs/layer_N/
+    def _layer_dir(layer: int) -> Path:
+        if len(layers) == 1 and layer == TARGET_LAYER:
+            return MEDICAL_OUTPUT_DIR
+        return MEDICAL_OUTPUT_DIR / f"layer_{layer}"
+
+    MEDICAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "="*60)
     print("  Medical SAE Pipeline")
-    print(f"  Model: {MODEL_NAME} | Layer: {TARGET_LAYER} | Hook: {HOOK_TYPE}")
-    print(f"  Dataset: medmcqa + pubmed_qa + pubmed_abs (chat-formatted) | Output: {output_dir}")
+    layers_str = str(layers[0]) if len(layers) == 1 else str(layers)
+    print(f"  Model: {MODEL_NAME} | Layers: {layers_str} | Hook: {HOOK_TYPE}")
+    print(f"  Dataset: medmcqa + pubmed_qa + pubmed_abs (chat-formatted)")
     print("="*60)
     if args.quick:
         print("  [QUICK TEST MODE]")
+    if len(layers) > 1:
+        print(f"  Multi-layer mode: will train {len(layers)} SAEs, then run cross-layer analysis.")
 
-    # Step 1: Load model
+    # -------------------------------------------------------------------------
+    # Phase 1 — Collect activations for every requested layer (model loaded once)
+    # -------------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print("  Phase 1: Activation Collection")
+    print(f"{'='*60}")
+
     model = load_model(device)
+    layer_data: Dict[int, tuple] = {}   # layer → (token_ids, chunk_files, source_ids, source_list)
 
-    # Step 2: Collect activations as on-disk chunks (never load all into RAM)
-    manifest_path = output_dir / "activations.json"
-    token_ids_path = output_dir / "token_ids.pt"
-    source_ids_path = output_dir / "source_ids.pt"
-    source_list_path = output_dir / "source_list.json"
+    for layer in layers:
+        layer_dir = _layer_dir(layer)
+        layer_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.skip_collection and manifest_path.exists() and token_ids_path.exists():
-        print(f"\nLoading cached chunks from {output_dir}...")
-        with open(manifest_path) as f:
-            chunk_files = [Path(p) for p in json.load(f)]
-        token_ids = torch.load(token_ids_path)
-        source_ids = torch.load(source_ids_path) if source_ids_path.exists() else None
-        source_list = json.load(open(source_list_path)) if source_list_path.exists() else None
-        print(f"  Found {len(chunk_files)} chunk files, {token_ids.shape[0]:,} token IDs")
-    else:
-        token_ids, chunk_files, source_ids, source_list = collect_activations(
-            model, num_samples=num_samples, output_dir=output_dir,
-        )
+        manifest_path   = layer_dir / "activations.json"
+        token_ids_path  = layer_dir / "token_ids.pt"
+        source_ids_path = layer_dir / "source_ids.pt"
+        source_list_path = layer_dir / "source_list.json"
 
-    # Free model memory before SAE training
+        if args.skip_collection and manifest_path.exists() and token_ids_path.exists():
+            print(f"\n  [Layer {layer}] Loading cached chunks from {layer_dir}…")
+            with open(manifest_path) as f:
+                chunk_files = [Path(p) for p in json.load(f)]
+            token_ids = torch.load(token_ids_path)
+            source_ids = torch.load(source_ids_path) if source_ids_path.exists() else None
+            source_list = json.load(open(source_list_path)) if source_list_path.exists() else None
+            print(f"  Found {len(chunk_files)} chunks, {token_ids.shape[0]:,} tokens")
+        else:
+            print(f"\n  [Layer {layer}] Collecting from layer {layer}…")
+            token_ids, chunk_files, source_ids, source_list = collect_activations(
+                model, num_samples=num_samples, output_dir=layer_dir, layer=layer,
+            )
+
+        layer_data[layer] = (token_ids, chunk_files, source_ids, source_list)
+
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # Step 3: Train SAE — loads one chunk at a time
-    sae = SparseAutoencoder()
+    # -------------------------------------------------------------------------
+    # Phase 2 — Train one SAE per layer (no GPU model needed)
+    # -------------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print("  Phase 2: SAE Training")
+    print(f"{'='*60}")
 
-    # Initialise b_pre from a sample of real activations (geometric median approx).
-    # This centres the encoder input so pre-activations start near zero — critical
-    # for fast convergence and reducing dead features (Gao et al. 2024).
-    print("\nInitialising SAE bias from data sample...")
-    _init_chunk = torch.load(chunk_files[0])
-    _init_sample = _init_chunk[:min(2048, len(_init_chunk))]
-    sae.init_bias_from_data(_init_sample)
-    del _init_chunk, _init_sample
-    print(f"  b_pre initialised (mean norm: {sae.b_pre.data.norm().item():.3f})")
+    trained: Dict[int, tuple] = {}   # layer → (sae, history)
 
-    history = train_sae(sae, chunk_files, num_epochs=num_epochs, device=device)
+    for layer in layers:
+        token_ids, chunk_files, source_ids, source_list = layer_data[layer]
+        print(f"\n  [Layer {layer}] Training SAE…")
 
-    # Step 4: Analyze features — loads one chunk at a time
+        sae = SparseAutoencoder()
+
+        # Initialise b_pre from a sample of real activations (geometric median approx).
+        # This centres the encoder input so pre-activations start near zero — critical
+        # for fast convergence and reducing dead features (Gao et al. 2024).
+        print("  Initialising SAE bias from data sample…")
+        _init_chunk = torch.load(chunk_files[0])
+        _init_sample = _init_chunk[:min(2048, len(_init_chunk))]
+        sae.init_bias_from_data(_init_sample)
+        del _init_chunk, _init_sample
+        print(f"  b_pre initialised (mean norm: {sae.b_pre.data.norm().item():.3f})")
+
+        history = train_sae(sae, chunk_files, num_epochs=num_epochs, device=device)
+        trained[layer] = (sae, history)
+
+    # -------------------------------------------------------------------------
+    # Phase 3 — Feature analysis & save (model reloaded once for VocabProj)
+    # -------------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print("  Phase 3: Feature Analysis & Save")
+    print(f"{'='*60}")
+
     model = load_model(device)
-    print("\n  Feature analysis using dual methods:")
-    print("    - MaxAct: Find tokens that maximally activate each feature (±50 token context)")
-    print("    - VocabProj: Find tokens each feature promotes in output")
-    features_info = analyze_features(
-        sae, model, token_ids, chunk_files, device=device,
-        source_ids=source_ids, source_list=source_list,
-    )
 
-    # Step 5: Save results
-    save_results(sae, token_ids, chunk_files, features_info, history,
-                 output_dir=output_dir, source_ids=source_ids, source_list=source_list)
+    for layer in layers:
+        layer_dir = _layer_dir(layer)
+        token_ids, chunk_files, source_ids, source_list = layer_data[layer]
+        sae, history = trained[layer]
+
+        print(f"\n  [Layer {layer}] Analysing features…")
+        print("    MaxAct (input-centric)  + VocabProj (output-centric)")
+
+        features_info = analyze_features(
+            sae, model, token_ids, chunk_files, device=device,
+            source_ids=source_ids, source_list=source_list,
+        )
+        save_results(
+            sae, token_ids, chunk_files, features_info, history,
+            output_dir=layer_dir, source_ids=source_ids, source_list=source_list,
+            layer=layer,
+        )
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # -------------------------------------------------------------------------
+    # Phase 4 — Cross-layer analysis (only when >1 layer trained)
+    # -------------------------------------------------------------------------
+    if len(layers) > 1:
+        layer_dirs = {layer: _layer_dir(layer) for layer in layers}
+        cross_layer_analysis(layer_dirs)
 
 
 if __name__ == "__main__":

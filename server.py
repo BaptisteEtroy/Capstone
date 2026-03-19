@@ -21,11 +21,35 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
+import argparse
+
 from config import (
     SparseAutoencoder,
     MODEL_NAME, TARGET_LAYER, HOOK_TYPE,
     MEDICAL_OUTPUT_DIR, get_device,
 )
+
+# ---------------------------------------------------------------------------
+# CLI: --layer N  (default = TARGET_LAYER = 8)
+# When multi-layer training was used, outputs live in medical_outputs/layer_N/.
+# For single-layer / legacy runs they remain at medical_outputs/ directly.
+# ---------------------------------------------------------------------------
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument("--layer", type=int, default=TARGET_LAYER,
+                     help="Which layer's SAE to serve (default: 8)")
+_known, _ = _parser.parse_known_args()
+_SERVE_LAYER: int = _known.layer
+
+def _resolve_output_dir() -> Path:
+    """Return the directory where the requested layer's artefacts live."""
+    subdir = MEDICAL_OUTPUT_DIR / f"layer_{_SERVE_LAYER}"
+    if subdir.exists():
+        return subdir
+    # Fallback: legacy single-layer layout at root
+    return MEDICAL_OUTPUT_DIR
+
+_OUTPUT_DIR = _resolve_output_dir()
+_HOOK_POINT = f"blocks.{_SERVE_LAYER}.hook_{HOOK_TYPE}"
 
 _SPECIAL_TOKENS = {
     "<|endoftext|>", "<|begin_of_text|>", "<|end_of_text|>",
@@ -52,24 +76,24 @@ class ServerState:
     def load(self):
         if self.loaded or self.error:
             return
-        sae_path = MEDICAL_OUTPUT_DIR / "sae.pt"
+        sae_path = _OUTPUT_DIR / "sae.pt"
         if not sae_path.exists():
-            self.error = "SAE not found. Run: python main.py"
+            self.error = f"SAE not found at {sae_path}. Run: python main.py"
             return
         try:
             from transformer_lens import HookedTransformer
-            print("Loading model...")
+            print(f"Loading model (layer {_SERVE_LAYER})...")
             self.model = HookedTransformer.from_pretrained(MODEL_NAME, device=self.device)
             self.model.eval()
             print("Loading SAE...")
             self.sae = SparseAutoencoder.load(sae_path)
             self.sae.to(self.device)
             self.sae.eval()
-            labeled_path = MEDICAL_OUTPUT_DIR / "labeled_features.json"
+            labeled_path = _OUTPUT_DIR / "labeled_features.json"
             if labeled_path.exists():
                 with open(labeled_path) as f:
                     self.labeled_features = json.load(f)
-            features_path = MEDICAL_OUTPUT_DIR / "features.json"
+            features_path = _OUTPUT_DIR / "features.json"
             if features_path.exists():
                 with open(features_path) as f:
                     all_feats = json.load(f)
@@ -82,7 +106,7 @@ class ServerState:
                         self.feature_by_index[feat["index"]]["confidence"] = lbl.get("confidence", "low")
                         self.feature_by_index[feat["index"]]["reasoning"] = lbl.get("reasoning", "")
             self.loaded = True
-            print(f"Ready — {len(self.labeled_features)} labeled features")
+            print(f"Ready — {len(self.labeled_features)} labeled features (layer {_SERVE_LAYER})")
         except Exception as e:
             self.error = str(e)
             print(f"Load error: {e}")
@@ -91,11 +115,11 @@ class ServerState:
         """Load just the JSON data (no GPU needed) for browse/search endpoints."""
         if self.feature_by_index:
             return
-        labeled_path = MEDICAL_OUTPUT_DIR / "labeled_features.json"
+        labeled_path = _OUTPUT_DIR / "labeled_features.json"
         if labeled_path.exists():
             with open(labeled_path) as f:
                 self.labeled_features = json.load(f)
-        features_path = MEDICAL_OUTPUT_DIR / "features.json"
+        features_path = _OUTPUT_DIR / "features.json"
         if features_path.exists():
             with open(features_path) as f:
                 all_feats = json.load(f)
@@ -176,7 +200,7 @@ def _get_feature_label(idx: int) -> Tuple[str, str]:
 
 def _encode_text(text: str) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
     """Tokenize text, run model, return (hidden [seq, n_feat], token_ids, token_strs)."""
-    hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
+    hook_point = _HOOK_POINT
     tokens = srv.model.to_tokens(text)
     token_strs = [srv.model.tokenizer.decode([t]) for t in tokens[0]]
     with torch.no_grad():
@@ -280,6 +304,7 @@ async def health():
     return {
         "model_loaded": srv.loaded,
         "features_count": len(srv.labeled_features),
+        "layer": _SERVE_LAYER,
         "error": srv.error,
     }
 
@@ -342,7 +367,7 @@ async def chat_stream(req: ChatRequest):
             response = srv.model.tokenizer.decode(response_ids.tolist())
 
             # ── 4. Output attribution ────────────────────────────────────────
-            hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
+            hook_point = _HOOK_POINT
             prompt_len = tokens.shape[1]
             with torch.no_grad():
                 _, cache = srv.model.run_with_cache(generated)
@@ -422,7 +447,7 @@ def _do_steer(prompt: str, feature_strengths: Dict[int, float], max_tokens: int)
     decoder = srv.sae.decoder.weight.detach()
     steer_direction = decoder @ steering_vector
 
-    hook_point = f"blocks.{TARGET_LAYER}.hook_{HOOK_TYPE}"
+    hook_point = _HOOK_POINT
     tokens_orig = srv.model.to_tokens(prompt)
     input_len = tokens_orig.shape[1]
 

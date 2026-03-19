@@ -34,7 +34,7 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 load_dotenv()
 
-from config import MEDICAL_OUTPUT_DIR, MEDICAL_FEATURES_PATH
+from config import MEDICAL_OUTPUT_DIR, MEDICAL_FEATURES_PATH, TARGET_LAYER
 
 MAX_TOKENS_PER_SEQ = 128  # must match max_tokens in collect_activations
 
@@ -682,6 +682,12 @@ def main():
                         help="Max semantic features to send to Claude (default: 3500)")
     parser.add_argument("--batch-size", type=int, default=CLAUDE_BATCH_SIZE,
                         help=f"Features per Claude API call (default: {CLAUDE_BATCH_SIZE})")
+    parser.add_argument("--layer", type=int, default=TARGET_LAYER,
+                        help=(
+                            "Which layer's features to label (default: 8). "
+                            "Resolves to medical_outputs/layer_N/ for multi-layer runs, "
+                            "or medical_outputs/ for the legacy single-layer layout."
+                        ))
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--min-freq", type=float, default=0.0005,
                         help="Min activation frequency (default: 0.05%%)")
@@ -691,14 +697,19 @@ def main():
                         help="Disable quality filter for Claude candidates")
     args = parser.parse_args()
 
-    if not MEDICAL_FEATURES_PATH.exists():
-        print(f"Error: {MEDICAL_FEATURES_PATH} not found. Run main.py first.")
+    # Resolve per-layer directory (mirrors the logic in main.py and server.py)
+    layer_subdir = MEDICAL_OUTPUT_DIR / f"layer_{args.layer}"
+    output_dir = layer_subdir if layer_subdir.exists() else MEDICAL_OUTPUT_DIR
+    features_path = output_dir / "features.json"
+
+    if not features_path.exists():
+        print(f"Error: {features_path} not found. Run main.py first.")
         return
 
-    with open(MEDICAL_FEATURES_PATH) as f:
+    with open(features_path) as f:
         features = json.load(f)
 
-    print(f"Loaded {len(features)} features from {MEDICAL_FEATURES_PATH}")
+    print(f"Loaded {len(features)} features from {features_path} (layer {args.layer})")
 
     labeled_features = label_features(
         features,
@@ -718,7 +729,7 @@ def main():
 
     print_labeled_features(labeled_features)
 
-    output_path = Path(args.output) if args.output else MEDICAL_OUTPUT_DIR / "labeled_features.json"
+    output_path = Path(args.output) if args.output else output_dir / "labeled_features.json"
     save_labeled_features(labeled_features, output_path)
 
 
