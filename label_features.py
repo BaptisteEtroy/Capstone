@@ -59,41 +59,40 @@ class LabeledFeature:
 
 
 # =============================================================================
-# Claude API
+# OpenAI API
 # =============================================================================
 
-def call_claude(prompt: str, model: str = "claude-sonnet-4-6") -> str:
-    """
-    Call Anthropic Claude API.
+_SYSTEM_PROMPT = (
+    "You are an expert in mechanistic interpretability of neural networks. "
+    "Your task is to label features extracted from a Sparse Autoencoder (SAE) "
+    "trained on Llama 3.2 1B Instruct processing medical/clinical text. "
+    "MaxAct tokens are real input tokens (with activation strengths) that triggered "
+    "the feature — they show what the feature DETECTS. "
+    "VocabProj tokens are output tokens the feature PROMOTES — they show what the "
+    "feature CAUSES the model to predict. "
+    "Give specific, concrete labels — avoid vague terms like 'language patterns', "
+    "'text features', 'linguistic', or 'general concepts'."
+)
 
-    Switched from gpt-4o-mini: Claude Sonnet achieves the highest simulation
-    scores in the EleutherAI auto-interp benchmark (arXiv:2410.13928), making
-    it the best model for identifying subtle, monosemantic feature patterns.
-    """
+
+def call_llm(prompt: str, model: str = "gpt-4o-mini") -> str:
+    """Call OpenAI API for feature labeling."""
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-        response = client.messages.create(
+        from openai import OpenAI
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        response = client.chat.completions.create(
             model=model,
             max_tokens=2000,
-            system=(
-                "You are an expert in mechanistic interpretability of neural networks. "
-                "Your task is to label features extracted from a Sparse Autoencoder (SAE) "
-                "trained on Llama 3.2 1B Instruct processing medical/clinical text. "
-                "MaxAct tokens are real input tokens (with activation strengths) that triggered "
-                "the feature — they show what the feature DETECTS. "
-                "VocabProj tokens are output tokens the feature PROMOTES — they show what the "
-                "feature CAUSES the model to predict. "
-                "Give specific, concrete labels — avoid vague terms like 'language patterns', "
-                "'text features', 'linguistic', or 'general concepts'."
-            ),
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
         )
-        return response.content[0].text.strip()
+        return response.choices[0].message.content.strip()
     except ImportError:
-        raise ImportError("Please install anthropic: pip install anthropic>=0.30.0")
+        raise ImportError("Please install openai: pip install openai>=1.0.0")
     except Exception as e:
-        raise RuntimeError(f"Claude API error: {e}")
+        raise RuntimeError(f"OpenAI API error: {e}")
 
 
 # =============================================================================
@@ -491,7 +490,7 @@ def parse_batch_response(response: str, features_batch: List[Dict]) -> List[tupl
 
 def label_features(
     features: List[Dict],
-    model: str = "claude-sonnet-4-6",
+    model: str = "gpt-4o-mini",
     dry_run: bool = False,
     max_features: int = 3500,
     batch_size: int = CLAUDE_BATCH_SIZE,
@@ -535,11 +534,11 @@ def label_features(
         return list(heuristic_labeled.values())
 
     # ── Step 2: Claude semantic labeling — quality-filtered, skip heuristic hits
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("\nNo ANTHROPIC_API_KEY found — skipping semantic labeling.")
+    if not os.environ.get("OPENAI_API_KEY"):
+        print("\nNo OPENAI_API_KEY found — skipping semantic labeling.")
         return list(heuristic_labeled.values())
 
-    print(f"\nStep 2: Claude semantic labeling ({model})...")
+    print(f"\nStep 2: OpenAI semantic labeling ({model})...")
 
     if no_filter:
         candidates = features
@@ -562,7 +561,7 @@ def label_features(
         batch = features_to_label[i:i + batch_size]
         try:
             prompt = build_batch_prompt(batch)
-            response = call_claude(prompt, model)
+            response = call_llm(prompt, model)
             results = parse_batch_response(response, batch)
 
             labeled_ids = set()
@@ -692,9 +691,9 @@ def print_labeled_features(labeled_features: List[LabeledFeature]):
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Label SAE features using Claude + heuristics")
-    parser.add_argument("--model", type=str, default="claude-sonnet-4-6",
-                        help="Claude model ID (default: claude-sonnet-4-6)")
+    parser = argparse.ArgumentParser(description="Label SAE features using OpenAI + heuristics")
+    parser.add_argument("--model", type=str, default="gpt-4o-mini",
+                        help="OpenAI model ID (default: gpt-4o-mini)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview without API calls (runs heuristics, previews Claude candidates)")
     parser.add_argument("--heuristic-only", action="store_true",
