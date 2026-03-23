@@ -34,7 +34,7 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 load_dotenv()
 
-from config import MEDICAL_OUTPUT_DIR, MEDICAL_FEATURES_PATH
+from config import MEDICAL_OUTPUT_DIR, TARGET_LAYER
 
 MAX_TOKENS_PER_SEQ = 128  # must match max_tokens in collect_activations
 
@@ -54,44 +54,45 @@ class LabeledFeature:
     reasoning: str
     quality_score: float = 0.0
     label_source: str = "claude"   # "claude" | "heuristic_token" | "heuristic_positional"
+    maxact_entropy: float = 0.0    # Shannon entropy of MaxAct token distribution (low = monosemantic)
+    source_breakdown: Dict[str, float] = field(default_factory=dict)  # fraction from each dataset
 
 
 # =============================================================================
-# Claude API
+# OpenAI API
 # =============================================================================
 
-def call_claude(prompt: str, model: str = "claude-sonnet-4-6") -> str:
-    """
-    Call Anthropic Claude API.
+_SYSTEM_PROMPT = (
+    "You are an expert in mechanistic interpretability of neural networks. "
+    "Your task is to label features extracted from a Sparse Autoencoder (SAE) "
+    "trained on Llama 3.2 1B Instruct processing medical/clinical text. "
+    "MaxAct tokens are real input tokens (with activation strengths) that triggered "
+    "the feature — they show what the feature DETECTS. "
+    "VocabProj tokens are output tokens the feature PROMOTES — they show what the "
+    "feature CAUSES the model to predict. "
+    "Give specific, concrete labels — avoid vague terms like 'language patterns', "
+    "'text features', 'linguistic', or 'general concepts'."
+)
 
-    Switched from gpt-4o-mini: Claude Sonnet achieves the highest simulation
-    scores in the EleutherAI auto-interp benchmark (arXiv:2410.13928), making
-    it the best model for identifying subtle, monosemantic feature patterns.
-    """
+
+def call_llm(prompt: str, model: str = "gpt-4o-mini") -> str:
+    """Call OpenAI API for feature labeling."""
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-        response = client.messages.create(
+        from openai import OpenAI
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        response = client.chat.completions.create(
             model=model,
             max_tokens=2000,
-            system=(
-                "You are an expert in mechanistic interpretability of neural networks. "
-                "Your task is to label features extracted from a Sparse Autoencoder (SAE) "
-                "trained on Llama 3.2 1B Instruct processing medical/clinical text. "
-                "MaxAct tokens are real input tokens (with activation strengths) that triggered "
-                "the feature — they show what the feature DETECTS. "
-                "VocabProj tokens are output tokens the feature PROMOTES — they show what the "
-                "feature CAUSES the model to predict. "
-                "Give specific, concrete labels — avoid vague terms like 'language patterns', "
-                "'text features', 'linguistic', or 'general concepts'."
-            ),
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
         )
-        return response.content[0].text.strip()
+        return response.choices[0].message.content.strip()
     except ImportError:
-        raise ImportError("Please install anthropic: pip install anthropic>=0.30.0")
+        raise ImportError("Please install openai: pip install openai>=1.0.0")
     except Exception as e:
-        raise RuntimeError(f"Claude API error: {e}")
+        raise RuntimeError(f"OpenAI API error: {e}")
 
 
 # =============================================================================
@@ -109,6 +110,9 @@ def compute_quality_score(feature: Dict[str, Any]) -> float:
     - vocab_score:     More VocabProj tokens → clearer output-centric signal.
     - act_score:       Higher mean activation → stronger, more distinctive feature.
     - diversity_score: MaxAct tokens should be diverse (all-same → catch-all feature).
+    - entropy_score:   Low Shannon entropy → tokens cluster on a narrow concept
+                       (monosemantic). Normalized by log2(10) ≈ 3.32 bits (max for
+                       10 unique tokens with uniform distribution).
 
     freq_score is double-weighted as the strongest signal for monosemanticity.
     """
@@ -136,7 +140,14 @@ def compute_quality_score(feature: Dict[str, Any]) -> float:
             most_common_ratio = tokens.count(max(set(tokens), key=tokens.count)) / len(tokens)
             diversity_score = max(0.0, 1.0 - max(0.0, most_common_ratio - 0.4) / 0.6)
 
-    return (freq_score * 2 + max_act_score + vocab_score + act_score + diversity_score) / 6
+    entropy = feature.get("maxact_entropy", None)
+    if entropy is not None:
+        _MAX_ENTROPY = math.log2(10)  # uniform over 10 unique tokens ≈ 3.32 bits
+        entropy_score = max(0.0, 1.0 - entropy / _MAX_ENTROPY)
+    else:
+        entropy_score = diversity_score  # fallback: mirror diversity score
+
+    return (freq_score * 2 + max_act_score + vocab_score + act_score + diversity_score + entropy_score) / 7
 
 
 def filter_high_quality_features(
@@ -279,6 +290,9 @@ def heuristic_label_feature(feature: Dict[str, Any]) -> Optional[LabeledFeature]
         vp_logits = feature.get("vocab_projection_logits", [None] * 10)[:10]
         return list(zip(vp_tokens, vp_logits))
 
+    entropy = feature.get("maxact_entropy", 0.0)
+    src_breakdown = feature.get("source_breakdown", {})
+
     result = _token_pattern_label(max_act_tokens)
     if result:
         label, conf = result
@@ -287,6 +301,7 @@ def heuristic_label_feature(feature: Dict[str, Any]) -> Optional[LabeledFeature]
             max_act_tokens=_act_tuples(), vocab_proj_tokens=_vocab_tuples(),
             reasoning="Heuristic: token string pattern analysis",
             quality_score=quality, label_source="heuristic_token",
+            maxact_entropy=entropy, source_breakdown=src_breakdown,
         )
 
     pos_mean = feature.get("position_mean", 0.0)
@@ -299,6 +314,7 @@ def heuristic_label_feature(feature: Dict[str, Any]) -> Optional[LabeledFeature]
             max_act_tokens=_act_tuples(), vocab_proj_tokens=_vocab_tuples(),
             reasoning=f"Heuristic: positional (mean={pos_mean:.1f}, std={pos_std:.1f})",
             quality_score=quality, label_source="heuristic_positional",
+            maxact_entropy=entropy, source_breakdown=src_breakdown,
         )
 
     return None
@@ -399,9 +415,11 @@ def build_batch_prompt(features_batch: List[Dict[str, Any]]) -> str:
             else:
                 vocab_parts.append(repr(tok))
 
+        src_bd = feature.get("source_breakdown", {})
+        src_str = ", ".join(f"{k}={v*100:.0f}%" for k, v in sorted(src_bd.items())) if src_bd else "unknown"
         features_text += f"""
 ---
-FEATURE {feature['index']} (freq={feature['frequency']*100:.2f}%, mean_act={feature.get('mean_activation', 0):.3f})
+FEATURE {feature['index']} (freq={feature['frequency']*100:.2f}%, mean_act={feature.get('mean_activation', 0):.3f}, sources: {src_str})
 Triggers (MaxAct, sampled across activation quantiles):
   {chr(10).join(f'  {p}' for p in max_act_parts) if max_act_parts else '  No data'}
 Promotes (VocabProj, logit boost):
@@ -472,7 +490,7 @@ def parse_batch_response(response: str, features_batch: List[Dict]) -> List[tupl
 
 def label_features(
     features: List[Dict],
-    model: str = "claude-sonnet-4-6",
+    model: str = "gpt-4o-mini",
     dry_run: bool = False,
     max_features: int = 3500,
     batch_size: int = CLAUDE_BATCH_SIZE,
@@ -516,11 +534,11 @@ def label_features(
         return list(heuristic_labeled.values())
 
     # ── Step 2: Claude semantic labeling — quality-filtered, skip heuristic hits
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("\nNo ANTHROPIC_API_KEY found — skipping semantic labeling.")
+    if not os.environ.get("OPENAI_API_KEY"):
+        print("\nNo OPENAI_API_KEY found — skipping semantic labeling.")
         return list(heuristic_labeled.values())
 
-    print(f"\nStep 2: Claude semantic labeling ({model})...")
+    print(f"\nStep 2: OpenAI semantic labeling ({model})...")
 
     if no_filter:
         candidates = features
@@ -543,7 +561,7 @@ def label_features(
         batch = features_to_label[i:i + batch_size]
         try:
             prompt = build_batch_prompt(batch)
-            response = call_claude(prompt, model)
+            response = call_llm(prompt, model)
             results = parse_batch_response(response, batch)
 
             labeled_ids = set()
@@ -562,6 +580,8 @@ def label_features(
                         reasoning=reasoning,
                         quality_score=quality_scores[feature_id],
                         label_source="claude",
+                        maxact_entropy=feature_lookup[feature_id].get("maxact_entropy", 0.0),
+                        source_breakdown=feature_lookup[feature_id].get("source_breakdown", {}),
                     ))
                 else:
                     unlabeled_count += 1
@@ -625,6 +645,8 @@ def save_labeled_features(labeled_features: List[LabeledFeature], output_path: P
             "vocab_proj_logits": vp_logits,
             "reasoning":         f.reasoning,
             "quality_score":     round(f.quality_score, 4),
+            "maxact_entropy":    round(f.maxact_entropy, 4),
+            "source_breakdown":  f.source_breakdown,
         })
 
     with open(output_path, "w") as f:
@@ -669,9 +691,9 @@ def print_labeled_features(labeled_features: List[LabeledFeature]):
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Label SAE features using Claude + heuristics")
-    parser.add_argument("--model", type=str, default="claude-sonnet-4-6",
-                        help="Claude model ID (default: claude-sonnet-4-6)")
+    parser = argparse.ArgumentParser(description="Label SAE features using OpenAI + heuristics")
+    parser.add_argument("--model", type=str, default="gpt-4o-mini",
+                        help="OpenAI model ID (default: gpt-4o-mini)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview without API calls (runs heuristics, previews Claude candidates)")
     parser.add_argument("--heuristic-only", action="store_true",
@@ -682,6 +704,12 @@ def main():
                         help="Max semantic features to send to Claude (default: 3500)")
     parser.add_argument("--batch-size", type=int, default=CLAUDE_BATCH_SIZE,
                         help=f"Features per Claude API call (default: {CLAUDE_BATCH_SIZE})")
+    parser.add_argument("--layer", type=int, default=TARGET_LAYER,
+                        help=(
+                            "Which layer's features to label (default: 8). "
+                            "Resolves to medical_outputs/layer_N/ for multi-layer runs, "
+                            "or medical_outputs/ for the legacy single-layer layout."
+                        ))
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--min-freq", type=float, default=0.0005,
                         help="Min activation frequency (default: 0.05%%)")
@@ -691,14 +719,19 @@ def main():
                         help="Disable quality filter for Claude candidates")
     args = parser.parse_args()
 
-    if not MEDICAL_FEATURES_PATH.exists():
-        print(f"Error: {MEDICAL_FEATURES_PATH} not found. Run main.py first.")
+    # Resolve per-layer directory (mirrors the logic in main.py and server.py)
+    layer_subdir = MEDICAL_OUTPUT_DIR / f"layer_{args.layer}"
+    output_dir = layer_subdir if layer_subdir.exists() else MEDICAL_OUTPUT_DIR
+    features_path = output_dir / "features.json"
+
+    if not features_path.exists():
+        print(f"Error: {features_path} not found. Run main.py first.")
         return
 
-    with open(MEDICAL_FEATURES_PATH) as f:
+    with open(features_path) as f:
         features = json.load(f)
 
-    print(f"Loaded {len(features)} features from {MEDICAL_FEATURES_PATH}")
+    print(f"Loaded {len(features)} features from {features_path} (layer {args.layer})")
 
     labeled_features = label_features(
         features,
@@ -718,7 +751,7 @@ def main():
 
     print_labeled_features(labeled_features)
 
-    output_path = Path(args.output) if args.output else MEDICAL_OUTPUT_DIR / "labeled_features.json"
+    output_path = Path(args.output) if args.output else output_dir / "labeled_features.json"
     save_labeled_features(labeled_features, output_path)
 
 
