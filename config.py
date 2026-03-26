@@ -21,7 +21,7 @@ MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 D_MODEL = 2048
 
 # Layer: Middle layer for semantic features
-TARGET_LAYER = 8
+TARGET_LAYER = 12
 HOOK_TYPE = "resid_post"
 
 # SAE: BatchTopK architecture (Bussmann et al. 2024) — batch-level sparsity allocation.
@@ -39,7 +39,7 @@ AUX_K = 256            # features used in auxiliary loss (scaled up from 128 at 
 LEARNING_RATE = 1e-4
 NUM_EPOCHS = 5
 BATCH_SIZE = 4096
-NUM_SAMPLES = 30_000   
+NUM_SAMPLES = 500_000   
 
 # Output
 MEDICAL_OUTPUT_DIR = Path("medical_outputs")

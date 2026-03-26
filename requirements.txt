@@ -1,4 +1,6 @@
 # Core ML
+# NOTE for HPC (CUDA): install torch separately with:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 torch>=2.0.0
 transformers>=4.36.0
 datasets>=2.16.0
@@ -16,13 +18,9 @@ wandb>=0.15.0
 
 # Feature labeling
 python-dotenv>=1.0.0
-anthropic>=0.30.0
+openai>=1.0.0
 
-# UI / Visualization
-gradio>=4.0.0
-plotly>=5.18.0
-
-# New web server (replaces Gradio for custom HTML/JS/CSS UI)
+# Web server
 fastapi>=0.110.0
 uvicorn>=0.27.0
 python-multipart>=0.0.9
