@@ -56,6 +56,58 @@ class LabeledFeature:
     label_source: str = "claude"   # "claude" | "heuristic_token" | "heuristic_positional"
     maxact_entropy: float = 0.0    # Shannon entropy of MaxAct token distribution (low = monosemantic)
     source_breakdown: Dict[str, float] = field(default_factory=dict)  # fraction from each dataset
+    category: str = "General/Other"  # broad semantic category for thesis figures
+
+
+# =============================================================================
+# Feature Categorisation
+# =============================================================================
+
+# Rules are checked in order; first match wins.  Each rule is
+# (list_of_lowercase_keywords_to_search_in_label, category_name).
+_CATEGORY_RULES: List[Tuple[List[str], str]] = [
+    (["structural", "positional", "punctuation", "special token", "numeric", "digit",
+      "formatting", "whitespace", "early position", "late position", "sequence position"],
+     "Structural/Linguistic"),
+    (["research", "study design", "trial", "randomized", "cohort", "meta-analysis",
+      "systematic review", "statistical", "methodology", "experimental design",
+      "clinical study", "sample size", "control group", "bias"],
+     "Research Methodology"),
+    (["pharmacol", "drug", "medication", "therapeutic", "treatment", "dose", "dosage",
+      "antibiotic", "inhibitor", "agonist", "antagonist", "pharmaceutical",
+      "prescription", "side effect", "adverse", "toxicity"],
+     "Pharmacology"),
+    (["gene", "protein", "enzyme", "pathway", "metabolism", "biochem",
+      "molecular", "cellular", "receptor", "hormone", "signal transduction",
+      "amino acid", "nucleotide", "mrna", "expression"],
+     "Biochemical/Molecular"),
+    (["epidemiol", "prevalence", "incidence", "mortality", "public health",
+      "outbreak", "surveillance", "population", "risk factor", "exposure"],
+     "Epidemiological"),
+    (["anatomical", "anatomy", "organ", "tissue", "muscle", "bone", "nerve",
+      "artery", "vein", "gland", "vessel", "tract", "cavity", "region"],
+     "Anatomical"),
+    (["clinical", "diagnosis", "diagnostic", "symptom", "sign", "presentation",
+      "complication", "syndrome", "disease", "disorder", "condition", "finding",
+      "examination", "assessment", "patient", "surgical", "procedure", "patholog"],
+     "Clinical/Diagnostic"),
+]
+
+_CATEGORY_FALLBACK = "General/Other"
+
+
+def categorize_label(label: str) -> str:
+    """
+    Map a free-form feature label to a broad semantic category.
+
+    Checks _CATEGORY_RULES in order (first match wins) against the lowercased label.
+    Returns _CATEGORY_FALLBACK if no rule matches.
+    """
+    lower = label.lower()
+    for keywords, category in _CATEGORY_RULES:
+        if any(kw in lower for kw in keywords):
+            return category
+    return _CATEGORY_FALLBACK
 
 
 # =============================================================================
@@ -302,6 +354,7 @@ def heuristic_label_feature(feature: Dict[str, Any]) -> Optional[LabeledFeature]
             reasoning="Heuristic: token string pattern analysis",
             quality_score=quality, label_source="heuristic_token",
             maxact_entropy=entropy, source_breakdown=src_breakdown,
+            category=categorize_label(label),
         )
 
     pos_mean = feature.get("position_mean", 0.0)
@@ -315,6 +368,7 @@ def heuristic_label_feature(feature: Dict[str, Any]) -> Optional[LabeledFeature]
             reasoning=f"Heuristic: positional (mean={pos_mean:.1f}, std={pos_std:.1f})",
             quality_score=quality, label_source="heuristic_positional",
             maxact_entropy=entropy, source_breakdown=src_breakdown,
+            category=categorize_label(label),
         )
 
     return None
@@ -582,6 +636,7 @@ def label_features(
                         label_source="claude",
                         maxact_entropy=feature_lookup[feature_id].get("maxact_entropy", 0.0),
                         source_breakdown=feature_lookup[feature_id].get("source_breakdown", {}),
+                        category=categorize_label(label),
                     ))
                 else:
                     unlabeled_count += 1
@@ -638,6 +693,7 @@ def save_labeled_features(labeled_features: List[LabeledFeature], output_path: P
         data.append({
             "index":             f.index,
             "label":             f.label,
+            "category":          f.category,
             "confidence":        f.confidence,
             "label_source":      f.label_source,
             "max_act_tokens":    f.max_act_tokens,

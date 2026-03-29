@@ -15,6 +15,7 @@ Output layout:
                               medical_outputs/cross_layer_analysis.json
 """
 
+import math
 import torch
 import torch.nn.functional as F
 from torch.optim import Adam
@@ -240,7 +241,8 @@ def train_sae(
     optimizer = Adam(sae.parameters(), lr=learning_rate)
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=learning_rate * 0.1)
 
-    history = {"loss": [], "reconstruction": [], "dead_features_per_epoch": [], "epoch_losses": []}
+    history = {"loss": [], "reconstruction": [], "dead_features_per_epoch": [], "epoch_losses": [],
+               "entropy_per_epoch": [], "entropy_norm_per_epoch": []}
     global_step = 0
 
     # EMA of per-feature firing rate — tracks which features are alive over time.
@@ -296,7 +298,22 @@ def train_sae(
         epoch_dead = int((ema_freq < 1e-5).sum().item())
         history["dead_features_per_epoch"].append(epoch_dead)
         history["epoch_losses"].append(epoch_loss / epoch_steps)
-        print(f"  Epoch {epoch+1} avg loss: {epoch_loss / epoch_steps:.4f}  |  dead features (EMA): {epoch_dead}/{sae.d_hidden}")
+
+        # Shannon entropy of feature usage distribution (computed from EMA firing rates).
+        # H = -sum(p_i * log2(p_i)) over alive features only (dead features contribute 0).
+        # Tracks whether the SAE maintains a diverse, uniform spread of feature usage or
+        # collapses toward a small set of dominant features.
+        # entropy_norm: H / log2(d_hidden) → 0 (one feature dominates) to 1 (perfectly uniform).
+        freq_norm = ema_freq / (ema_freq.sum() + 1e-8)
+        alive_probs = freq_norm[freq_norm > 0]
+        entropy_bits = -(alive_probs * alive_probs.log2()).sum().item()
+        entropy_norm = entropy_bits / math.log2(sae.d_hidden)
+        history["entropy_per_epoch"].append(round(entropy_bits, 4))
+        history["entropy_norm_per_epoch"].append(round(entropy_norm, 4))
+
+        print(f"  Epoch {epoch+1} avg loss: {epoch_loss / epoch_steps:.4f}  |  "
+              f"dead: {epoch_dead}/{sae.d_hidden}  |  "
+              f"H={entropy_bits:.2f} bits  ({entropy_norm:.3f} norm)")
 
     print(f"\nTraining complete!")
     return history
@@ -957,7 +974,7 @@ def save_results(
         "avg_l0_sparsity": avg_l0,
         "explained_variance": explained_variance,
         "final_loss": history["loss"][-1] if history["loss"] else None,
-        "analysis_methods": ["MaxAct (input-centric)", "VocabProj (output-centric)"],
+        "analysis_methods": ["MaxAct (input-centric)", "VocabProj (output-centric)", "TokenChange (causal)"],
     }
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
@@ -1059,15 +1076,35 @@ def cross_layer_analysis(layer_dirs: Dict[int, Path]):
         shared_count_b2a = int((sims_b2a > HIGH_SIM_THRESHOLD).sum().item())
 
         # Collect top shared feature pairs (idx_in_A, idx_in_B, similarity)
+        # Full mapping above threshold (for convergence analysis) — save all, not just top 50
         shared_pairs = []
         if shared_count_a2b > 0:
             shared_indices_a = shared_a2b_mask.nonzero(as_tuple=True)[0].tolist()
-            for idx_a in sorted(shared_indices_a, key=lambda i: -sims_a2b[i].item())[:50]:
+            for idx_a in sorted(shared_indices_a, key=lambda i: -sims_a2b[i].item()):
                 shared_pairs.append({
                     "layer_a_feature": int(idx_a),
                     "layer_b_feature": int(idx_a2b[idx_a]),
                     "cosine_similarity": round(float(sims_a2b[idx_a].item()), 4),
                 })
+
+        # Many-to-one convergence: find layer_b features that multiple layer_a features map to.
+        # These are the "convergence points" — a single L(N+1) feature that absorbs several
+        # distinct L(N) features, showing how representations consolidate with depth.
+        from collections import defaultdict as _dd
+        target_to_sources: Dict[int, list] = _dd(list)
+        for pair in shared_pairs:
+            target_to_sources[pair["layer_b_feature"]].append(
+                {"source": pair["layer_a_feature"], "cosine_similarity": pair["cosine_similarity"]}
+            )
+        convergence_patterns = [
+            {
+                "layer_b_feature": tgt,
+                "n_sources": len(srcs),
+                "sources": sorted(srcs, key=lambda x: -x["cosine_similarity"]),
+            }
+            for tgt, srcs in sorted(target_to_sources.items(), key=lambda kv: -len(kv[1]))
+            if len(srcs) >= 2
+        ]
 
         pair_key = f"{layer_a}_{layer_b}"
         results["pairs"][pair_key] = {
@@ -1089,8 +1126,10 @@ def cross_layer_analysis(layer_dirs: Dict[int, Path]):
                 "median_max_similarity": round(float(sims_b2a.median()), 4),
                 "shared_features_count": shared_count_b2a,
                 "shared_features_pct":   round(shared_count_b2a / W_b.shape[0] * 100, 2),
+                "histogram": _histogram(sims_b2a),
             },
             "top_shared_pairs": shared_pairs,
+            "convergence_patterns": convergence_patterns,
         }
 
         print(f"    mean_max_sim={results['pairs'][pair_key]['a_to_b']['mean_max_similarity']:.4f}  "
