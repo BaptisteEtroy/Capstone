@@ -275,7 +275,45 @@ function buildDrawerBody(feat) {
     </div>
   ` : '';
 
-  // Vocab projections
+  // TokenChange (causal output-centric) — primary output signal
+  const tcPromoted   = feat.token_change_promoted  || [];
+  const tcSuppressed = feat.token_change_suppressed || [];
+  const tcKL         = feat.token_change_kl         || 0;
+  const tcKLStd      = feat.token_change_kl_std     || 0;
+
+  let tokenChange = '';
+  if (tcPromoted.length > 0) {
+    const klStrength = tcKL > 0.5 ? 'strong' : tcKL > 0.1 ? 'moderate' : 'weak';
+    const promotedChips = tcPromoted.slice(0, 8).map(t =>
+      `<span class="vocab-chip tc-promoted">${escapeHtml(t)}</span>`).join('');
+    const suppressedChips = tcSuppressed.slice(0, 5).map(t =>
+      `<span class="vocab-chip tc-suppressed">${escapeHtml(t)}</span>`).join('');
+    const consistencyNote = tcKLStd > 0
+      ? `<span style="font-size:10px;color:var(--text-2);margin-left:8px">consistency ±${tcKLStd.toFixed(3)}</span>`
+      : '';
+    tokenChange = `
+      <div class="feat-drawer-section">
+        <h3>Token Change <span class="tc-kl-badge">${klStrength} effect · KL ${tcKL.toFixed(3)}</span>${consistencyNote}</h3>
+        <div style="margin-bottom:6px">
+          <span class="tc-sub-label">Promotes</span>
+          <div class="feat-vocab-chips">${promotedChips}</div>
+        </div>
+        ${suppressedChips ? `<div>
+          <span class="tc-sub-label">Suppresses</span>
+          <div class="feat-vocab-chips">${suppressedChips}</div>
+        </div>` : ''}
+      </div>`;
+  }
+
+  // Disagreement indicator between TokenChange and VocabProj
+  const vpTop4 = new Set((feat.vocab_proj || []).slice(0, 4));
+  const tcTop4 = new Set(tcPromoted.slice(0, 4));
+  const overlap = [...tcTop4].filter(t => vpTop4.has(t)).length;
+  const disagreementNote = (tcTop4.size >= 2 && vpTop4.size >= 2 && overlap < 2)
+    ? `<div class="tc-disagreement">⚠ TokenChange and VocabProj disagree — downstream nonlinearity active</div>`
+    : '';
+
+  // Vocab projections (geometric, secondary)
   const vocabPills = (feat.vocab_proj || []).map((tok, i) => {
     const logit = feat.vocab_proj_logits?.[i];
     return `<span class="vocab-chip">${escapeHtml(tok)}${logit !== undefined ? ` <span style="color:var(--text-3)">${logit.toFixed(2)}</span>` : ''}</span>`;
@@ -283,7 +321,8 @@ function buildDrawerBody(feat) {
 
   const vocab = vocabPills ? `
     <div class="feat-drawer-section">
-      <h3>Vocab Projection (what this feature promotes)</h3>
+      <h3>Vocab Projection <span style="font-size:10px;font-weight:400;color:var(--text-2)">(geometric · secondary)</span></h3>
+      ${disagreementNote}
       <div class="feat-vocab-chips">${vocabPills}</div>
     </div>
   ` : '';
@@ -309,7 +348,7 @@ function buildDrawerBody(feat) {
     </div>
   ` : '';
 
-  return stats + reasoning + vocab + evidence;
+  return stats + reasoning + tokenChange + vocab + evidence;
 }
 
 function closeDrawer() {

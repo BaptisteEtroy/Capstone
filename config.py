@@ -108,6 +108,14 @@ class FeatureInfo:
     # Fraction of MaxAct examples that came from each training dataset.
     # Keys are source_id strings (e.g. "medmcqa", "pubmed_qa", "pubmed_abs").
     source_breakdown: Dict[str, float] = field(default_factory=dict)
+    # TokenChange (causal output-centric): inject decoder direction via hook, measure
+    # how next-token distribution shifts. More rigorous than VocabProj at layer 12
+    # because it runs the real forward pass through all downstream transformer layers.
+    token_change_promoted: List[str] = field(default_factory=list)
+    token_change_suppressed: List[str] = field(default_factory=list)
+    token_change_kl: float = 0.0       # mean KL(steered || baseline) across contexts
+    token_change_kl_std: float = 0.0   # std of KL across contexts (consistency signal)
+    token_change_n_contexts: int = 0   # how many MaxAct examples were used
 
 
 # =============================================================================

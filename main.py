@@ -385,6 +385,119 @@ def build_context_string(global_token_idx: int, token_ids: torch.Tensor, tokeniz
     return "".join(parts)
 
 
+def _context_tokens_for_example(
+    global_token_idx: int,
+    token_ids: torch.Tensor,
+    window: int = 50,
+) -> tuple:
+    """
+    Return (context_token_ids [seq], within_context_position) for a MaxAct example.
+    Mirrors build_context_string boundary logic exactly — respects BOS (ID 128000).
+    Used by TokenChange to reconstruct the forward-pass context without re-tokenizing.
+    """
+    n = len(token_ids)
+    bos_id = 128000
+
+    start = max(0, global_token_idx - window)
+    for pos in range(global_token_idx - 1, start - 1, -1):
+        if token_ids[pos].item() == bos_id:
+            start = pos + 1
+            break
+
+    end = min(n, global_token_idx + window + 1)
+    for pos in range(global_token_idx + 1, end):
+        if token_ids[pos].item() == bos_id:
+            end = pos
+            break
+
+    context = token_ids[start:end]
+    position = global_token_idx - start
+    return context, position
+
+
+def compute_token_change_for_feature(
+    model: HookedTransformer,
+    sae: "SparseAutoencoder",
+    feat_idx: int,
+    max_act_examples: list,
+    token_ids: torch.Tensor,
+    layer: int,
+    device: str,
+    mean_activation: float,
+    scale_multiplier: float = 5.0,
+    top_k: int = 10,
+) -> Optional[Dict]:
+    """
+    Causal output-centric analysis. Inject feat_idx's decoder direction at `layer`
+    via a TransformerLens hook and measure how the next-token distribution shifts at
+    the active token position — averaged across up to 5 MaxAct contexts.
+
+    Returns None if no valid examples could be processed.
+
+    Why this is better than VocabProj at layer 12:
+    - VocabProj: decoder_col @ W_U (single linear step, ignores 4 downstream layers)
+    - TokenChange: real forward pass through all remaining layers + RMSNorm + W_U
+    Dead features are naturally filtered: they produce low, inconsistent KL across
+    contexts, so token_change_kl_std / token_change_kl will be high.
+    """
+    examples = [e for e in max_act_examples[:5] if e.global_token_idx >= 0]
+    if not examples:
+        return None
+
+    decoder_dir = sae.decoder.weight[:, feat_idx].detach().to(device)  # [d_model]
+    hook_point = f"blocks.{layer}.hook_resid_post"
+    scale = max(scale_multiplier * mean_activation, 1.0)
+
+    kl_list: list = []
+    deltas: list = []
+
+    for ex in examples:
+        context, position = _context_tokens_for_example(ex.global_token_idx, token_ids)
+        if position < 0 or position >= len(context):
+            continue
+
+        ctx_tensor = context.unsqueeze(0).to(device)  # [1, seq]
+
+        # Closure captures current `position` correctly via default arg
+        def inject_fn(activation, hook, _pos=position):
+            activation[:, _pos, :] = activation[:, _pos, :] + scale * decoder_dir
+            return activation
+
+        try:
+            with torch.no_grad():
+                baseline_logits = model(ctx_tensor)[0, position, :].float()
+                steered_logits = model.run_with_hooks(
+                    ctx_tensor, fwd_hooks=[(hook_point, inject_fn)]
+                )[0, position, :].float()
+        except Exception:
+            continue
+
+        bp = F.softmax(baseline_logits, dim=-1)
+        sp = F.softmax(steered_logits, dim=-1)
+        kl = F.kl_div(bp.log(), sp, reduction="sum").item()
+        kl_list.append(kl)
+        deltas.append((sp - bp).cpu())
+
+    if not deltas:
+        return None
+
+    mean_delta = torch.stack(deltas).mean(0)          # [vocab_size]
+    mean_kl = sum(kl_list) / len(kl_list)
+    kl_std = float(torch.tensor(kl_list).std()) if len(kl_list) > 1 else 0.0
+
+    top_promoted   = mean_delta.topk(top_k).indices.tolist()
+    top_suppressed = mean_delta.topk(top_k, largest=False).indices.tolist()
+    tok = model.tokenizer
+
+    return {
+        "top_promoted":   [tok.decode([i]) for i in top_promoted],
+        "top_suppressed": [tok.decode([i]) for i in top_suppressed],
+        "mean_kl":        mean_kl,
+        "kl_std":         kl_std,
+        "n_contexts":     len(deltas),
+    }
+
+
 def analyze_features(
     sae: SparseAutoencoder,
     model: HookedTransformer,
@@ -395,6 +508,7 @@ def analyze_features(
     device: Optional[str] = None,
     source_ids: Optional[torch.Tensor] = None,
     source_list: Optional[List[str]] = None,
+    layer: int = TARGET_LAYER,
 ) -> List[FeatureInfo]:
     """
     Analyze learned features using combined input/output-centric methods.
@@ -562,9 +676,41 @@ def analyze_features(
     top_vocab_values  = torch.cat(all_top_values,  dim=0)  # [d_hidden, top_k]
     top_vocab_indices = torch.cat(all_top_indices, dim=0)  # [d_hidden, top_k]
     del unembed_cpu, decoder_cpu, all_top_values, all_top_indices
-    
+
     tokenizer = model.tokenizer
-    
+
+    # =========================================================================
+    # Pass 4: TokenChange (causal output-centric)
+    # Inject each feature's decoder direction at `layer` via a hook and measure
+    # how the next-token distribution shifts at the active token position.
+    # Uses up to 5 MaxAct contexts per feature; skips dead features (no MaxAct).
+    # =========================================================================
+    print("\n  Pass 4: Computing TokenChange (causal output-centric)...")
+    token_change_results: Dict[int, Optional[Dict]] = {}
+    for feat_idx in tqdm(top_feature_indices, desc="  TokenChange"):
+        if max_act_values[feat_idx].max().item() <= 0:
+            token_change_results[feat_idx] = None
+            continue
+
+        # Build lightweight stubs — only global_token_idx and activation are used
+        stubs = []
+        for sp in max_act_values[feat_idx].argsort(descending=True):
+            act_val = max_act_values[feat_idx][sp].item()
+            if act_val <= 0:
+                break
+            stubs.append(MaxActExample(
+                token="", token_id=0, activation=act_val,
+                global_token_idx=max_act_indices[feat_idx][sp].item(),
+            ))
+            if len(stubs) >= 5:
+                break
+
+        token_change_results[feat_idx] = compute_token_change_for_feature(
+            model, sae, feat_idx, stubs, token_ids,
+            layer=layer, device=device,
+            mean_activation=feature_mean[feat_idx].item(),
+        )
+
     # =========================================================================
     # Build FeatureInfo for top features
     # =========================================================================
@@ -646,6 +792,7 @@ def analyze_features(
             vocab_logit_values.append(logit_val)
         
         pos_mean, pos_std = max_act_positions.get(feat_idx, (0.0, 0.0))
+        tc = token_change_results.get(feat_idx) or {}
         info = FeatureInfo(
             index=feat_idx,
             activation_frequency=feature_freq[feat_idx].item(),
@@ -658,6 +805,11 @@ def analyze_features(
             position_std=pos_std,
             maxact_entropy=token_entropy(max_act_examples[:10]),
             source_breakdown=source_breakdown(max_act_examples[:10], source_list or []),
+            token_change_promoted=tc.get("top_promoted", []),
+            token_change_suppressed=tc.get("top_suppressed", []),
+            token_change_kl=tc.get("mean_kl", 0.0),
+            token_change_kl_std=tc.get("kl_std", 0.0),
+            token_change_n_contexts=tc.get("n_contexts", 0),
         )
         features_info.append(info)
     
@@ -775,6 +927,12 @@ def save_results(
             "maxact_entropy": f.maxact_entropy,
             # Source attribution: precomputed in analyze_features()
             "source_breakdown": f.source_breakdown,
+            # TokenChange (causal output-centric): empty lists if not computed
+            "token_change_promoted": f.token_change_promoted,
+            "token_change_suppressed": f.token_change_suppressed,
+            "token_change_kl": round(f.token_change_kl, 4),
+            "token_change_kl_std": round(f.token_change_kl_std, 4),
+            "token_change_n_contexts": f.token_change_n_contexts,
         }
         for f in features_info
     ]
@@ -956,6 +1114,14 @@ def main():
     parser.add_argument("--skip-collection", action="store_true", help="Reuse cached activations")
     parser.add_argument("--device", type=str, default=None, help="Device override (auto-detected)")
     parser.add_argument(
+        "--validate-token-change", action="store_true",
+        help=(
+            "Sanity-check TokenChange on the 10 most coherent features (low MaxAct "
+            "entropy, sufficient examples) and print a comparison table, then exit. "
+            "Requires trained SAE + features.json in the output directory."
+        ),
+    )
+    parser.add_argument(
         "--layers", nargs="+", type=int, default=[TARGET_LAYER],
         help=(
             "One or more residual-stream layers to train SAEs on "
@@ -968,6 +1134,89 @@ def main():
     args = parser.parse_args()
 
     device = args.device or get_device()
+
+    # ------------------------------------------------------------------
+    # --validate-token-change: sanity-check on 10 coherent features
+    # ------------------------------------------------------------------
+    if args.validate_token_change:
+        layers_val: List[int] = args.layers
+        layer_val = layers_val[0]
+
+        def _val_dir(l: int) -> Path:
+            if len(layers_val) == 1 and l == TARGET_LAYER:
+                return MEDICAL_OUTPUT_DIR
+            return MEDICAL_OUTPUT_DIR / f"layer_{l}"
+
+        out_dir = _val_dir(layer_val)
+        feat_path = out_dir / "features.json"
+        sae_path  = out_dir / "sae.pt"
+        if not feat_path.exists() or not sae_path.exists():
+            print(f"[validate] Missing {feat_path} or {sae_path} — run full pipeline first.")
+            return
+
+        print(f"\n[validate-token-change] Layer {layer_val}, dir: {out_dir}")
+        with open(feat_path) as fh:
+            all_feats = json.load(fh)
+
+        # Load labeled labels if available
+        label_map: Dict[int, str] = {}
+        lbl_path = out_dir / "labeled_features.json"
+        if lbl_path.exists():
+            with open(lbl_path) as fh:
+                for lf in json.load(fh):
+                    label_map[lf["index"]] = lf.get("label", "")
+
+        # Pick top-10 by coherence: enough MaxAct examples + low entropy + alive
+        candidates = [
+            f for f in all_feats
+            if len(f.get("max_activating_tokens", [])) >= 3
+            and f.get("frequency", 0) > 0.0001
+            and f.get("maxact_entropy", 999) < 3.0
+        ]
+        candidates.sort(key=lambda f: f.get("maxact_entropy", 999))
+        candidates = candidates[:10]
+
+        if not candidates:
+            print("[validate] No suitable features found — check features.json.")
+            return
+
+        sae = SparseAutoencoder.load(sae_path, device=device)
+        model = load_model(device)
+
+        # Load token_ids for context reconstruction
+        tok_path = out_dir / "token_ids.pt"
+        if not tok_path.exists():
+            print("[validate] token_ids.pt not found — cannot reconstruct contexts.")
+            return
+        token_ids_val = torch.load(tok_path)
+
+        print(f"\n{'─'*100}")
+        print(f"{'Idx':>6}  {'Label':<35}  {'MaxAct top-3':<30}  {'VocabProj top-3':<30}  {'TC promoted top-3':<30}  {'KL':>6}")
+        print(f"{'─'*100}")
+
+        for feat in candidates:
+            fidx = feat["index"]
+            stubs = [
+                MaxActExample(token="", token_id=0, activation=e["activation"],
+                              global_token_idx=e["global_token_idx"])
+                for e in feat.get("max_activating_tokens", [])[:5]
+            ]
+            tc = compute_token_change_for_feature(
+                model, sae, fidx, stubs, token_ids_val,
+                layer=layer_val, device=device,
+                mean_activation=feat.get("mean", 1.0),
+            )
+            maxact_top  = [e["token"] for e in feat.get("max_activating_tokens", [])[:3]]
+            vocab_top   = feat.get("vocab_projection", [])[:3]
+            tc_top      = (tc or {}).get("top_promoted", [])[:3]
+            kl_val      = (tc or {}).get("mean_kl", 0.0)
+            label       = label_map.get(fidx, "")[:34]
+            print(f"{fidx:>6}  {label:<35}  {str(maxact_top):<30}  {str(vocab_top):<30}  {str(tc_top):<30}  {kl_val:>6.3f}")
+
+        print(f"{'─'*100}")
+        print("\n[validate] Done. High KL + TC tokens matching MaxAct = method working correctly.")
+        return
+
     num_samples = 500 if args.quick else NUM_SAMPLES
     num_epochs = 1 if args.quick else NUM_EPOCHS
     layers: List[int] = args.layers
@@ -1080,6 +1329,7 @@ def main():
         features_info = analyze_features(
             sae, model, token_ids, chunk_files, device=device,
             source_ids=source_ids, source_list=source_list,
+            layer=layer,
         )
         save_results(
             sae, token_ids, chunk_files, features_info, history,

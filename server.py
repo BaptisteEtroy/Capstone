@@ -653,6 +653,10 @@ async def get_feature(idx: int):
         "examples": examples,
         "vocab_proj": f.get("vocab_projection", f.get("vocab_proj_tokens", []))[:10],
         "vocab_proj_logits": f.get("vocab_projection_logits", [])[:10],
+        "token_change_promoted": f.get("token_change_promoted", [])[:10],
+        "token_change_suppressed": f.get("token_change_suppressed", [])[:10],
+        "token_change_kl": f.get("token_change_kl", 0.0),
+        "token_change_kl_std": f.get("token_change_kl_std", 0.0),
     }
 
 
