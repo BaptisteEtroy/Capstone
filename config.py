@@ -37,7 +37,7 @@ AUX_K = 256            # features used in auxiliary loss (scaled up from 128 at 
 
 # Training
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 5
+NUM_EPOCHS = 8
 BATCH_SIZE = 4096
 NUM_SAMPLES = 500_000   
 
