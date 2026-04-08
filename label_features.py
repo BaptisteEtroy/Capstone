@@ -12,10 +12,10 @@ Features are labeled using two complementary methods:
 gpt-4o-mini labels take priority if both methods produce a label for the same feature.
 
 Usage:
-    python label_features.py              # Heuristic + Claude (default)
+    python label_features.py              # Heuristic + LLM (default)
     python label_features.py --dry-run    # Preview without API calls
-    python label_features.py --heuristic-only   # Skip Claude entirely (free)
-    python label_features.py --no-heuristic     # Claude only
+    python label_features.py --heuristic-only   # Skip LLM entirely (free)
+    python label_features.py --no-heuristic     # LLM only
     python label_features.py --min-freq 0.0005 --max-freq 0.30  # Custom thresholds
 """
 
@@ -375,7 +375,7 @@ def heuristic_label_feature(feature: Dict[str, Any]) -> Optional[LabeledFeature]
 
 
 # =============================================================================
-# Feature Labeling Logic (Batched Claude)
+# Feature Labeling Logic (Batched LLM Calls)
 # =============================================================================
 
 LLM_BATCH_SIZE = 30   # smaller batches → better attention per feature
@@ -587,7 +587,7 @@ def label_features(
             _preview_features(features, min_freq, max_freq, no_filter)
         return list(heuristic_labeled.values())
 
-    # ── Step 2: Claude semantic labeling — quality-filtered, skip heuristic hits
+    # ── Step 2: LLM semantic labeling — quality-filtered, skip heuristic hits
     if not os.environ.get("OPENAI_API_KEY"):
         print("\nNo OPENAI_API_KEY found — skipping semantic labeling.")
         return list(heuristic_labeled.values())
