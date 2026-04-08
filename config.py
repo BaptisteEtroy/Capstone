@@ -240,7 +240,7 @@ class SparseAutoencoder(nn.Module):
 
         # Auxiliary loss (Gao et al. 2024): give unfired features gradient by
         # having them reconstruct the residual error.
-        # Uses aux_k=512 (much larger than main k) to give more dead features signal.
+        # Uses aux_k=256 (much larger than main k=64) to give more dead features signal.
         aux_loss = torch.tensor(0.0, device=x.device)
         if self.training and self.aux_coeff > 0:
             pre_aux = pre.detach().clone()

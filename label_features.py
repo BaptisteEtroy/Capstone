@@ -5,11 +5,11 @@ Features are labeled using two complementary methods:
 1. Heuristic labeling (free, no API): detects syntactic, morphological, and
    positional features using token string patterns and position statistics.
 
-2. Claude semantic labeling: for features that pass a quality filter and were
-   not already claimed by heuristics, batch API calls to Claude Sonnet assign
+2. gpt-4o-mini semantic labeling: for features that pass a quality filter and were
+   not already claimed by heuristics, batch API calls to gpt-4o-mini assign
    semantic labels ("proverbs and sayings", "US state names", etc.).
 
-Claude labels take priority if both methods produce a label for the same feature.
+gpt-4o-mini labels take priority if both methods produce a label for the same feature.
 
 Usage:
     python label_features.py              # Heuristic + Claude (default)
@@ -53,7 +53,7 @@ class LabeledFeature:
     vocab_proj_tokens: List
     reasoning: str
     quality_score: float = 0.0
-    label_source: str = "claude"   # "claude" | "heuristic_token" | "heuristic_positional"
+    label_source: str = "gpt4omini"   # "gpt4omini" | "heuristic_token" | "heuristic_positional"
     maxact_entropy: float = 0.0    # Shannon entropy of MaxAct token distribution (low = monosemantic)
     source_breakdown: Dict[str, float] = field(default_factory=dict)  # fraction from each dataset
     category: str = "General/Other"  # broad semantic category for thesis figures
@@ -378,7 +378,7 @@ def heuristic_label_feature(feature: Dict[str, Any]) -> Optional[LabeledFeature]
 # Feature Labeling Logic (Batched Claude)
 # =============================================================================
 
-CLAUDE_BATCH_SIZE = 30   # smaller batches → better attention per feature
+LLM_BATCH_SIZE = 30   # smaller batches → better attention per feature
 
 
 def extract_feature_tokens(feature: Dict[str, Any]) -> tuple:
@@ -440,7 +440,7 @@ def build_batch_prompt(features_batch: List[Dict[str, Any]]) -> str:
     samples from quantiles (not just top tokens) for better generalisation.
 
     Key changes from previous version:
-    - Explicitly tells Claude the model is Llama 3.2 1B Instruct on medical chat data
+    - Explicitly tells gpt-4o-mini the model is Llama 3.2 1B Instruct on medical chat data
     - Shows activation magnitude alongside context (not just token string)
     - Samples from top/mid/low tiers to reveal the feature's true range
     - No chain-of-thought in reasoning field (CoT doesn't improve quality per arXiv:2410.13928)
@@ -547,7 +547,7 @@ def label_features(
     model: str = "gpt-4o-mini",
     dry_run: bool = False,
     max_features: int = 3500,
-    batch_size: int = CLAUDE_BATCH_SIZE,
+    batch_size: int = LLM_BATCH_SIZE,
     min_freq: float = 0.0001,
     max_freq: float = 0.30,
     no_filter: bool = False,
@@ -555,14 +555,14 @@ def label_features(
     no_heuristic: bool = False,
 ) -> List[LabeledFeature]:
     """
-    Label features using heuristics first, then Claude for the rest.
+    Label features using heuristics first, then gpt-4o-mini for the rest.
 
     Heuristics cover: punctuation, digits, special tokens, positional.
     They run on ALL features with no frequency filter and are always included
     in the output JSON (previously they were being lost due to a save bug — fixed).
 
-    Claude runs on quality-filtered semantic candidates not already claimed.
-    Claude labels win if both methods produce a result for the same feature.
+    gpt-4o-mini runs on quality-filtered semantic candidates not already claimed.
+    gpt-4o-mini labels win if both methods produce a result for the same feature.
     """
     print(f"\nTotal features available: {len(features)}")
 
@@ -583,7 +583,7 @@ def label_features(
 
     if heuristic_only or dry_run:
         if dry_run:
-            print("\n[DRY RUN] Would also run Claude on quality-filtered features.")
+            print("\n[DRY RUN] Would also run gpt-4o-mini on quality-filtered features.")
             _preview_features(features, min_freq, max_freq, no_filter)
         return list(heuristic_labeled.values())
 
@@ -606,12 +606,12 @@ def label_features(
     num_batches = (len(features_to_label) + batch_size - 1) // batch_size
     print(f"  Labeling top {len(features_to_label)} candidates | Batch size: {batch_size} | API calls: {num_batches}")
 
-    claude_labeled: List[LabeledFeature] = []
+    llm_labeled: List[LabeledFeature] = []
     unlabeled_count = 0
     quality_scores = {f["index"]: compute_quality_score(f) for f in features_to_label}
     feature_lookup = {f["index"]: f for f in features_to_label}
 
-    for i in tqdm(range(0, len(features_to_label), batch_size), desc="  Claude batches"):
+    for i in tqdm(range(0, len(features_to_label), batch_size), desc="  gpt-4o-mini batches"):
         batch = features_to_label[i:i + batch_size]
         try:
             prompt = build_batch_prompt(batch)
@@ -625,7 +625,7 @@ def label_features(
                 labeled_ids.add(feature_id)
                 if "UNLABELED" not in label.upper():
                     max_act, vocab_proj = extract_feature_tokens(feature_lookup[feature_id])
-                    claude_labeled.append(LabeledFeature(
+                    llm_labeled.append(LabeledFeature(
                         index=feature_id,
                         label=label,
                         confidence=confidence,
@@ -633,7 +633,7 @@ def label_features(
                         vocab_proj_tokens=vocab_proj,
                         reasoning=reasoning,
                         quality_score=quality_scores[feature_id],
-                        label_source="claude",
+                        label_source="gpt4omini",
                         maxact_entropy=feature_lookup[feature_id].get("maxact_entropy", 0.0),
                         source_breakdown=feature_lookup[feature_id].get("source_breakdown", {}),
                         category=categorize_label(label),
@@ -647,18 +647,18 @@ def label_features(
             print(f"\nError labeling batch at feature {batch[0]['index']}: {e}")
             unlabeled_count += len(batch)
 
-    label_rate = len(claude_labeled) / len(features_to_label) * 100 if features_to_label else 0
-    print(f"\n  Claude labeled: {len(claude_labeled)} features ({label_rate:.1f}% label rate)")
+    label_rate = len(llm_labeled) / len(features_to_label) * 100 if features_to_label else 0
+    print(f"\n  gpt-4o-mini labeled: {len(llm_labeled)} features ({label_rate:.1f}% label rate)")
     print(f"  Unlabeled (not monosemantic): {unlabeled_count}")
 
-    # ── Merge: Claude takes priority over heuristic for same feature index ────
-    claude_indices = {lf.index for lf in claude_labeled}
-    final = [lf for lf in heuristic_labeled.values() if lf.index not in claude_indices]
-    final.extend(claude_labeled)
+    # ── Merge: gpt-4o-mini takes priority over heuristic for same feature index ────
+    llm_indices = {lf.index for lf in llm_labeled}
+    final = [lf for lf in heuristic_labeled.values() if lf.index not in llm_indices]
+    final.extend(llm_labeled)
 
     print(f"\n  Total labeled features: {len(final)}")
-    print(f"    Heuristic: {sum(1 for lf in final if lf.label_source != 'claude')}")
-    print(f"    Claude:    {sum(1 for lf in final if lf.label_source == 'claude')}")
+    print(f"    Heuristic:   {sum(1 for lf in final if lf.label_source != 'gpt4omini')}")
+    print(f"    gpt-4o-mini: {sum(1 for lf in final if lf.label_source == 'gpt4omini')}")
 
     return final
 
@@ -669,7 +669,7 @@ def _preview_features(features, min_freq, max_freq, no_filter):
     else:
         candidates = filter_high_quality_features(features, min_freq=min_freq, max_freq=max_freq)
     candidates.sort(key=compute_quality_score, reverse=True)
-    print(f"\n  Top 10 semantic candidates (would be sent to Claude):")
+    print(f"\n  Top 10 semantic candidates (would be sent to gpt-4o-mini):")
     for f in candidates[:10]:
         max_act, _ = extract_feature_tokens(f)
         score = compute_quality_score(f)
@@ -716,9 +716,9 @@ def print_labeled_features(labeled_features: List[LabeledFeature]):
     print("  LABELED FEATURES")
     print("=" * 60)
 
-    claude_feats    = [f for f in labeled_features if f.label_source == "claude"]
-    heuristic_feats = [f for f in labeled_features if f.label_source != "claude"]
-    print(f"\n  Sources: {len(claude_feats)} Claude | {len(heuristic_feats)} heuristic")
+    llm_feats       = [f for f in labeled_features if f.label_source == "gpt4omini"]
+    heuristic_feats = [f for f in labeled_features if f.label_source != "gpt4omini"]
+    print(f"\n  Sources: {len(llm_feats)} gpt-4o-mini | {len(heuristic_feats)} heuristic")
 
     if heuristic_feats:
         by_src = Counter(f.label_source for f in heuristic_feats)
@@ -751,15 +751,15 @@ def main():
     parser.add_argument("--model", type=str, default="gpt-4o-mini",
                         help="OpenAI model ID (default: gpt-4o-mini)")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Preview without API calls (runs heuristics, previews Claude candidates)")
+                        help="Preview without API calls (runs heuristics, previews gpt-4o-mini candidates)")
     parser.add_argument("--heuristic-only", action="store_true",
-                        help="Heuristic labeling only — no Claude API calls")
+                        help="Heuristic labeling only — no gpt-4o-mini API calls")
     parser.add_argument("--no-heuristic", action="store_true",
-                        help="Skip heuristic labeling, use Claude only")
+                        help="Skip heuristic labeling, use gpt-4o-mini only")
     parser.add_argument("--max-features", type=int, default=3500,
-                        help="Max semantic features to send to Claude (default: 3500)")
-    parser.add_argument("--batch-size", type=int, default=CLAUDE_BATCH_SIZE,
-                        help=f"Features per Claude API call (default: {CLAUDE_BATCH_SIZE})")
+                        help="Max semantic features to send to gpt-4o-mini (default: 3500)")
+    parser.add_argument("--batch-size", type=int, default=LLM_BATCH_SIZE,
+                        help=f"Features per gpt-4o-mini API call (default: {LLM_BATCH_SIZE})")
     parser.add_argument("--layer", type=int, default=TARGET_LAYER,
                         help=(
                             "Which layer's features to label (default: 8). "
@@ -772,7 +772,7 @@ def main():
     parser.add_argument("--max-freq", type=float, default=0.30,
                         help="Max activation frequency (default: 30%%)")
     parser.add_argument("--no-filter", action="store_true",
-                        help="Disable quality filter for Claude candidates")
+                        help="Disable quality filter for gpt-4o-mini candidates")
     args = parser.parse_args()
 
     # Resolve per-layer directory (mirrors the logic in main.py and server.py)
