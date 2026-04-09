@@ -3,7 +3,7 @@
 Medical SAE pipeline for Llama 3.2 1B.
 
 Usage:
-    python main.py                          # Full pipeline, layer 8 (default)
+    python main.py                          # Full pipeline, layer 12 (default)
     python main.py --layers 4 8 12         # Train SAEs on layers 4, 8, and 12
     python main.py --quick                  # Quick test (500 samples, 1 epoch)
     python main.py --skip-collection        # Reuse cached activations
@@ -194,7 +194,6 @@ def collect_activations(
     token_ids = torch.cat(all_token_ids, dim=0)
     source_ids = torch.tensor(all_source_idxs, dtype=torch.long)
 
-    # Trim to match actual token count (source_idxs may be slightly longer due to padding)
     source_ids = source_ids[:token_ids.shape[0]]
 
     print(f"  Collected {token_ids.shape[0]:,} tokens across {len(chunk_files)} chunks | Sources: {len(source_list)} unique")
@@ -234,7 +233,7 @@ def train_sae(
 
     print(f"\nTraining SAE...")
     print(f"  Architecture: {sae.d_model} -> {sae.d_hidden} -> {sae.d_model}")
-    print(f"  TopK: K={sae.k} (L0={sae.k} exactly, guaranteed)")
+    print(f"  TopK: K={sae.k} (avg L0 ≈ {sae.k} per token across batch)")
     print(f"  Epochs: {num_epochs}, Batch size: {batch_size}, LR: {learning_rate}")
     print(f"  Chunks: {len(chunk_files)} (loaded one at a time)")
 
@@ -670,9 +669,9 @@ def analyze_features(
         max_act_positions[feat_idx] = (pos_mean, pos_std)
     
     # =========================================================================
-    # Output-centric: VocabProj - Project decoder vectors onto vocabulary
+    # Pass 3: VocabProj — project decoder vectors onto vocabulary
     # =========================================================================
-    print("  Computing VocabProj (output-centric)...")
+    print("  Pass 3: Computing VocabProj (output-centric)...")
     # Compute in CPU chunks to avoid OOM: [d_hidden, vocab_size] at fp32 is ~8 GB for d_hidden=16384.
     # Process FEAT_CHUNK features at a time instead of the full matrix at once.
     unembed_cpu = model.W_U.detach().cpu()       # [d_model, vocab_size]
@@ -697,7 +696,7 @@ def analyze_features(
     tokenizer = model.tokenizer
 
     # =========================================================================
-    # Pass 4: TokenChange (causal output-centric)
+    # Pass 4: TokenChange — causal output-centric
     # Inject each feature's decoder direction at `layer` via a hook and measure
     # how the next-token distribution shifts at the active token position.
     # Uses up to 5 MaxAct contexts per feature; skips dead features (no MaxAct).
@@ -852,18 +851,15 @@ def save_results(
 
     sae.save(output_dir / "sae.pt")
 
-    # Token IDs are small — save directly
     torch.save(token_ids, output_dir / "token_ids.pt")
     print(f"  Saved token_ids: {token_ids.shape}")
 
-    # Source IDs for training data attribution
     if source_ids is not None and source_list is not None:
         torch.save(source_ids, output_dir / "source_ids.pt")
         with open(output_dir / "source_list.json", "w") as f:
             json.dump(source_list, f)
         print(f"  Saved source_ids: {source_ids.shape[0]:,} tokens, {len(source_list)} sources")
 
-    # Chunk file manifest (so --skip-collection can find them)
     chunk_manifest = [str(p) for p in chunk_files]
     with open(output_dir / "activations.json", "w") as f:
         json.dump(chunk_manifest, f)
@@ -917,7 +913,6 @@ def save_results(
     explained_variance = 1.0 - (var_res / var_x_total) if var_x_total > 0 else 0.0
     explained_variance = round(float(explained_variance), 6)
     
-    # Save feature analysis with both MaxAct and VocabProj
     features_data = [
         {
             "index": f.index,
@@ -937,14 +932,10 @@ def save_results(
             ],
             "vocab_projection": f.vocab_projection,
             "vocab_projection_logits": f.vocab_projection_logits,
-            # Positional: where in the sequence this feature tends to fire
             "position_mean": round(f.position_mean, 2),
             "position_std": round(f.position_std, 2),
-            # Monosemanticity proxy: precomputed in analyze_features()
             "maxact_entropy": f.maxact_entropy,
-            # Source attribution: precomputed in analyze_features()
             "source_breakdown": f.source_breakdown,
-            # TokenChange (causal output-centric): empty lists if not computed
             "token_change_promoted": f.token_change_promoted,
             "token_change_suppressed": f.token_change_suppressed,
             "token_change_kl": round(f.token_change_kl, 4),
@@ -957,7 +948,6 @@ def save_results(
         json.dump(features_data, f, indent=2)
     print(f"  Saved feature analysis: {len(features_info)} features")
     
-    # Save training history
     with open(output_dir / "training_history.json", "w") as f:
         json.dump(history, f, indent=2)
     print(f"  Saved training history")
@@ -1164,7 +1154,7 @@ def main():
         "--layers", nargs="+", type=int, default=[TARGET_LAYER],
         help=(
             "One or more residual-stream layers to train SAEs on "
-            "(default: [8]).  E.g. --layers 4 8 12.  "
+            "(default: [12]).  E.g. --layers 4 8 12.  "
             "When more than one layer is given, cross_layer_analysis() is run "
             "afterwards and the decoder cosine-similarity results are written to "
             "medical_outputs/cross_layer_analysis.json."
@@ -1261,8 +1251,8 @@ def main():
     layers: List[int] = args.layers
 
     # Per-layer output directory.
-    # Single-layer default (layer 8) → medical_outputs/  (backward-compatible).
-    # Any other configuration       → medical_outputs/layer_N/
+    # Single-layer default (layer 12) → medical_outputs/  (backward-compatible).
+    # Any other configuration         → medical_outputs/layer_N/
     def _layer_dir(layer: int) -> Path:
         if len(layers) == 1 and layer == TARGET_LAYER:
             return MEDICAL_OUTPUT_DIR

@@ -269,14 +269,11 @@ def filter_high_quality_features(
     min_vocab_proj: int = 0,
 ) -> List[Dict[str, Any]]:
     """
-    Thresholds lowered to capture more valid features:
-    - min_freq 0.0005 → 0.0001: the previous threshold was above the mean activation
-      frequency of alive features, cutting out ~half the labelable set. Rare medical
-      terminology (drug names, anatomy, procedures) fires infrequently but is highly
-      interpretable.
-    - min_vocab_proj 3 → 0: VocabProj always stores 10 tokens; this gate was a no-op
-      for most features but silently dropped features with sparse decoder projections.
-      Removed — quality score already penalises uninformative projections.
+    Filters features by activation frequency and MaxAct example count.
+    The CLI default is min_freq=0.0005; this function's default is 0.0001 to
+    allow rare but highly interpretable features (drug names, anatomy, procedures)
+    when called directly. Quality score penalises uninformative VocabProj projections
+    so no separate vocab_proj gate is needed.
     """
     filtered = []
     stats = {"too_rare": 0, "too_common": 0, "few_max_act": 0}
@@ -827,9 +824,9 @@ def main():
                         ))
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--min-freq", type=float, default=0.0005,
-                        help="Min activation frequency (default: 0.05%%)")
+                        help="Min activation frequency (default: 0.05%)")
     parser.add_argument("--max-freq", type=float, default=0.30,
-                        help="Max activation frequency (default: 30%%)")
+                        help="Max activation frequency (default: 30%)")
     parser.add_argument("--no-filter", action="store_true",
                         help="Disable quality filter for gpt-4o-mini candidates")
     args = parser.parse_args()

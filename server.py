@@ -30,13 +30,13 @@ from config import (
 )
 
 # ---------------------------------------------------------------------------
-# CLI: --layer N  (default = TARGET_LAYER = 8)
+# CLI: --layer N  (default = TARGET_LAYER = 12)
 # When multi-layer training was used, outputs live in medical_outputs/layer_N/.
 # For single-layer / legacy runs they remain at medical_outputs/ directly.
 # ---------------------------------------------------------------------------
 _parser = argparse.ArgumentParser(add_help=False)
 _parser.add_argument("--layer", type=int, default=TARGET_LAYER,
-                     help="Which layer's SAE to serve (default: 8)")
+                     help="Which layer's SAE to serve (default: 12)")
 _known, _ = _parser.parse_known_args()
 _SERVE_LAYER: int = _known.layer
 
@@ -220,14 +220,12 @@ def _top_features_full(
     """Like _top_features but also returns token_indices (top positions in the sequence),
     and optionally source_breakdown + max_act_examples for output attribution."""
     max_per_feat = hidden.max(dim=0).values.cpu()
-    # Gather a wide candidate pool (top_k * 5) above threshold
     pool_size = min(top_k * 5, max_per_feat.shape[0])
     vals_all, idxs_all = max_per_feat.topk(pool_size)
     candidates = [
         (val, idx) for val, idx in zip(vals_all.tolist(), idxs_all.tolist())
         if val >= threshold
     ]
-    # Prioritize labeled features (confidence != 'unknown'), then unlabeled, both sorted by activation
     labeled_set = {i for _, i in candidates if srv.feature_by_index.get(i, {}).get("confidence", "unknown") != "unknown"}
     labeled   = [(v, i) for v, i in candidates if i in labeled_set]
     unlabeled = [(v, i) for v, i in candidates if i not in labeled_set]
@@ -244,7 +242,6 @@ def _top_features_full(
         ]
         vocab_proj = fdata.get("vocab_projection", [])[:6]
 
-        # Which positions in the sequence activated this feature most?
         feat_acts = hidden[:, idx].cpu()
         n_top = min(3, feat_acts.shape[0])
         top_tok = feat_acts.topk(n_top)
@@ -264,8 +261,6 @@ def _top_features_full(
         }
 
         if include_source:
-            # Use the precomputed breakdown from features.json (populated by analyze_features).
-            # Falls back to counting source_id prefixes inline if field is absent (legacy data).
             if fdata.get("source_breakdown"):
                 entry["source_breakdown"] = fdata["source_breakdown"]
             else:
@@ -365,7 +360,6 @@ async def chat_stream(req: ChatRequest):
                     verbose=False,
                 )
 
-            # Stream response tokens to the client
             response_ids = generated[0, tokens.shape[1]:]
             for token_id in response_ids.tolist():
                 tok_str = srv.model.tokenizer.decode([token_id])
@@ -386,7 +380,6 @@ async def chat_stream(req: ChatRequest):
                 output_hidden = srv.sae.encode(gen_acts.to(srv.device))
             output_features = _top_features_full(output_hidden, top_k=8, include_source=True)
 
-            # Response tokens — keep all (incl. EOS placeholder) so token_indices align
             response_token_strs = [
                 srv.model.tokenizer.decode([t]) for t in response_ids.tolist()
             ]
@@ -531,7 +524,6 @@ async def circuit(req: CircuitRequest):
         max_per_feat = filtered.max(axis=0)            # [n_features]
         activated = np.where(max_per_feat > 0.5)[0]
         sorted_by_act = activated[np.argsort(max_per_feat[activated])[::-1]].tolist()
-        # Labeled features first, then unlabeled, both sorted by activation
         labeled_idxs   = [i for i in sorted_by_act if srv.feature_by_index.get(int(i), {}).get("label", "").strip()]
         unlabeled_idxs = [i for i in sorted_by_act if int(i) not in {int(x) for x in labeled_idxs}]
         top_indices = (labeled_idxs + unlabeled_idxs)[:20]
@@ -549,7 +541,6 @@ async def circuit(req: CircuitRequest):
                 "vocab_proj": vocab_proj,
             })
 
-        # Build token→feature links
         links = []
         for tok_i, tok_str in enumerate(valid_toks):
             for feat_i, feat_idx in enumerate(top_indices[:15]):
