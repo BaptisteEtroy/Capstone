@@ -278,7 +278,7 @@ class SparseAutoencoder(nn.Module):
 
     @classmethod
     def load(cls, path: Path) -> "SparseAutoencoder":
-        checkpoint = torch.load(path, weights_only=False)
+        checkpoint = torch.load(path, weights_only=False, map_location="cpu")
         sae = cls(
             d_model=checkpoint["d_model"],
             expansion_factor=checkpoint["d_hidden"] // checkpoint["d_model"],
