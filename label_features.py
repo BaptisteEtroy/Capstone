@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Features are labeled using two complementary methods:
+features are labeled using two complementary methods:
 
-1. Heuristic labeling (free, no API): detects syntactic, morphological, and
+1. heuristic labeling (free, no API): detects syntactic, morphological, and
    positional features using token string patterns and position statistics.
 
-2. gpt-4o-mini semantic labeling: for features that pass a quality filter and were
-   not already claimed by heuristics, batch API calls to gpt-4o-mini assign
+2. gpt-4o-mini semantic labeling: for features that pass a quality filter and weren't
+   already claimed by heuristics, batch API calls to gpt-4o-mini assign
    semantic labels ("proverbs and sayings", "US state names", etc.).
 
 gpt-4o-mini labels take priority if both methods produce a label for the same feature.
@@ -39,13 +39,11 @@ from config import MEDICAL_OUTPUT_DIR, TARGET_LAYER
 MAX_TOKENS_PER_SEQ = 128  # must match max_tokens in collect_activations
 
 
-# =============================================================================
-# Data Class
-# =============================================================================
+# data class
 
 @dataclass
 class LabeledFeature:
-    """A feature with its auto-generated label."""
+    """a feature with its auto-generated label."""
     index: int
     label: str
     confidence: str        # "high", "medium", "low"
@@ -54,19 +52,17 @@ class LabeledFeature:
     reasoning: str
     quality_score: float = 0.0
     label_source: str = "gpt4omini"   # "gpt4omini" | "heuristic_token" | "heuristic_positional"
-    maxact_entropy: float = 0.0    # Shannon entropy of MaxAct token distribution (low = monosemantic)
+    maxact_entropy: float = 0.0    # shannon entropy of maxact token distribution (low = monosemantic)
     source_breakdown: Dict[str, float] = field(default_factory=dict)  # fraction from each dataset
     category: str = "General/Other"  # broad semantic category for thesis figures
 
 
-# =============================================================================
-# Feature Categorisation
-# =============================================================================
+# feature categorisation
 
-# Rules are checked in order; first match wins.  Each rule is
-# (list_of_lowercase_keywords_to_search_in_label, category_name).
+# rules are checked in order, first match wins
+# each rule is (list of lowercase keywords to search in label, category name)
 _CATEGORY_RULES: List[Tuple[List[str], str]] = [
-    # Structural/Linguistic — expanded to catch heuristic positional labels
+    # structural/linguistic - expanded to catch heuristic positional labels
     (["structural", "positional", "punctuation", "special token", "numeric", "digit",
       "formatting", "whitespace", "early position", "late position", "sequence position",
       "early-position", "late-position", "fixed-position", "context-start", "context-end",
@@ -75,7 +71,7 @@ _CATEGORY_RULES: List[Tuple[List[str], str]] = [
       "citation", "reference number", "journal", "publication", "bibliography",
       "abbreviation", "acronym", "parenthetical", "list marker"],
      "Structural/Linguistic"),
-    # Research Methodology — expanded
+    # research methodology - expanded
     (["research", "study design", "trial", "randomized", "cohort", "meta-analysis",
       "systematic review", "statistical", "methodology", "experimental design",
       "clinical study", "sample size", "control group", "bias",
@@ -84,7 +80,7 @@ _CATEGORY_RULES: List[Tuple[List[str], str]] = [
       "retrospective", "case-control", "blinding", "placebo", "survey",
       "questionnaire", "measurement", "instrument validation"],
      "Research Methodology"),
-    # Pharmacology — expanded
+    # pharmacology - expanded
     (["pharmacol", "drug", "medication", "therapeutic", "treatment", "dose", "dosage",
       "antibiotic", "inhibitor", "agonist", "antagonist", "pharmaceutical",
       "prescription", "side effect", "adverse", "toxicity",
@@ -92,24 +88,24 @@ _CATEGORY_RULES: List[Tuple[List[str], str]] = [
       "anti-inflammatory", "antiviral", "antifungal", "antimicrobial",
       "contraindic", "drug interaction", "pharmacokinetic", "bioavailab"],
      "Pharmacology"),
-    # NEW: Microbiology/Infectious Disease
+    # microbiology/infectious disease
     (["bacteri", "viral", "virus", "fung", "parasit", "infect",
       "pathogen", "microb", "sepsis", "steriliz", "contagi",
       "endotoxin", "exotoxin", "biofilm", "antimicrobial resistance",
       "gram-positive", "gram-negative", "flora", "prion"],
      "Microbiology/Infectious"),
-    # NEW: Oncology
+    # oncology
     (["cancer", "tumor", "tumour", "oncol", "malign", "metasta",
       "carcinoma", "lymphoma", "leukemia", "neoplasm", "sarcoma",
       "staging", "grading", "biopsy", "remission", "recurrence"],
      "Oncology"),
-    # NEW: Mental Health/Psych
+    # mental health/psych
     (["psych", "depress", "anxiety", "cognitive", "emotion",
       "mental health", "schizoph", "autism", "bipolar", "adhd",
       "behavioral", "behaviour", "neuropsych", "dementia", "therapy session",
       "counseling", "counselling", "psychiatric", "mood"],
      "Mental Health/Psych"),
-    # Biochemical/Molecular — expanded
+    # biochemical/molecular - expanded
     (["gene", "protein", "enzyme", "pathway", "metabolism", "biochem",
       "molecular", "cellular", "receptor", "hormone", "signal transduction",
       "amino acid", "nucleotide", "mrna", "expression",
@@ -119,21 +115,21 @@ _CATEGORY_RULES: List[Tuple[List[str], str]] = [
       "mitochond", "ribosom", "atp", "cytoplasm", "membrane transport",
       "ion channel", "catalytic", "substrate"],
      "Biochemical/Molecular"),
-    # Epidemiological — expanded
+    # epidemiological - expanded
     (["epidemiol", "prevalence", "incidence", "mortality", "public health",
       "outbreak", "surveillance", "population", "risk factor", "exposure",
       "screening", "socioeconomic", "disparit", "morbidity", "demographic",
       "age-adjusted", "endemic", "pandemic", "epidemic", "vaccination rate",
       "health outcome", "social determinant"],
      "Epidemiological"),
-    # Anatomical — expanded
+    # anatomical - expanded
     (["anatomical", "anatomy", "organ", "tissue", "muscle", "bone", "nerve",
       "artery", "vein", "gland", "vessel", "tract", "cavity", "region",
       "ligament", "tendon", "cartilage", "fascia", "peritoneum", "pleura",
       "mediastin", "meninges", "spinal cord", "brain region", "cortex",
       "cerebr", "thorac", "abdomin", "pelvi", "cranial"],
      "Anatomical"),
-    # Clinical/Diagnostic — expanded
+    # clinical/diagnostic - expanded
     (["clinical", "diagnosis", "diagnostic", "symptom", "sign", "presentation",
       "complication", "syndrome", "disease", "disorder", "condition", "finding",
       "examination", "assessment", "patient", "surgical", "procedure", "patholog",
@@ -157,10 +153,10 @@ _CATEGORY_FALLBACK = "General/Other"
 
 def categorize_label(label: str) -> str:
     """
-    Map a free-form feature label to a broad semantic category.
+    map a free-form feature label to a broad semantic category.
 
-    Checks _CATEGORY_RULES in order (first match wins) against the lowercased label.
-    Returns _CATEGORY_FALLBACK if no rule matches.
+    checks _CATEGORY_RULES in order (first match wins) against the lowercased label.
+    returns _CATEGORY_FALLBACK if no rule matches.
     """
     lower = label.lower()
     for keywords, category in _CATEGORY_RULES:
@@ -169,9 +165,7 @@ def categorize_label(label: str) -> str:
     return _CATEGORY_FALLBACK
 
 
-# =============================================================================
-# OpenAI API
-# =============================================================================
+# openai API
 
 _SYSTEM_PROMPT = (
     "You are an expert in mechanistic interpretability of neural networks. "
@@ -187,7 +181,7 @@ _SYSTEM_PROMPT = (
 
 
 def call_llm(prompt: str, model: str = "gpt-4o-mini") -> str:
-    """Call OpenAI API for feature labeling."""
+    """call openai API for feature labeling."""
     try:
         from openai import OpenAI
         client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -206,26 +200,23 @@ def call_llm(prompt: str, model: str = "gpt-4o-mini") -> str:
         raise RuntimeError(f"OpenAI API error: {e}")
 
 
-# =============================================================================
-# Quality Filtering & Scoring
-# =============================================================================
+# quality filtering and scoring
 
 def compute_quality_score(feature: Dict[str, Any]) -> float:
     """
-    Score a feature by its likelihood of being monosemantic (higher = better).
+    score a feature by its likelihood of being monosemantic (higher = better).
 
-    Components:
-    - freq_score:      Peaks at ~2% activation frequency. Penalises always-on
-                       (polysemantic) and near-dead features equally.
-    - max_act_score:   More MaxAct examples → more evidence of what the feature detects.
-    - vocab_score:     More VocabProj tokens → clearer output-centric signal.
-    - act_score:       Higher mean activation → stronger, more distinctive feature.
-    - diversity_score: MaxAct tokens should be diverse (all-same → catch-all feature).
-    - entropy_score:   Low Shannon entropy → tokens cluster on a narrow concept
-                       (monosemantic). Normalized by log2(10) ≈ 3.32 bits (max for
-                       10 unique tokens with uniform distribution).
+    components:
+    - freq_score:      peaks at ~2% activation frequency, penalises always-on
+                       (polysemantic) and near-dead features equally
+    - max_act_score:   more maxact examples = more evidence of what the feature detects
+    - vocab_score:     more vocabproj tokens = clearer output-centric signal
+    - act_score:       higher mean activation = stronger, more distinctive feature
+    - diversity_score: maxact tokens should be diverse (all-same means catch-all feature)
+    - entropy_score:   low shannon entropy means tokens cluster on a narrow concept
+                       (monosemantic), normalized by log2(10) ~= 3.32 bits
 
-    freq_score is double-weighted as the strongest signal for monosemanticity.
+    freq_score is double-weighted as it's the strongest signal for monosemanticity.
     """
     freq = feature.get("frequency", 0)
     freq_score = max(0.0, 1.0 - abs(math.log10(max(freq, 1e-6)) - math.log10(0.02)) / 1.5)
@@ -253,7 +244,7 @@ def compute_quality_score(feature: Dict[str, Any]) -> float:
 
     entropy = feature.get("maxact_entropy", None)
     if entropy is not None:
-        _MAX_ENTROPY = math.log2(10)  # uniform over 10 unique tokens ≈ 3.32 bits
+        _MAX_ENTROPY = math.log2(10)  # uniform over 10 unique tokens ~= 3.32 bits
         entropy_score = max(0.0, 1.0 - entropy / _MAX_ENTROPY)
     else:
         entropy_score = diversity_score  # fallback: mirror diversity score
@@ -269,10 +260,10 @@ def filter_high_quality_features(
     min_vocab_proj: int = 0,
 ) -> List[Dict[str, Any]]:
     """
-    Filters features by activation frequency and MaxAct example count.
-    The CLI default is min_freq=0.0005; this function's default is 0.0001 to
+    filters features by activation frequency and maxact example count.
+    the CLI default is min_freq=0.0005; this function's default is 0.0001 to
     allow rare but highly interpretable features (drug names, anatomy, procedures)
-    when called directly. Quality score penalises uninformative VocabProj projections
+    when called directly. quality score penalises uninformative vocabproj projections
     so no separate vocab_proj gate is needed.
     """
     filtered = []
@@ -299,12 +290,10 @@ def filter_high_quality_features(
     return filtered
 
 
-# =============================================================================
-# Heuristic Labeling (no API required)
-# =============================================================================
+# heuristic labeling (no API required)
 
 def _extract_raw_tokens(max_act_tokens: list) -> List[str]:
-    """Extract raw token strings (with spaces preserved) from MaxAct list."""
+    """extract raw token strings (with spaces preserved) from maxact list."""
     raw = []
     for item in max_act_tokens:
         if isinstance(item, dict):
@@ -318,8 +307,8 @@ def _extract_raw_tokens(max_act_tokens: list) -> List[str]:
 
 def _token_pattern_label(max_act_tokens: list) -> Optional[Tuple[str, str]]:
     """
-    Classify by token string patterns alone. Returns (label, confidence) or None.
-    Only catches obvious syntactic patterns: special tokens, punctuation, digits.
+    classify by token string patterns alone. returns (label, confidence) or None.
+    only catches obvious syntactic patterns: special tokens, punctuation, digits.
     """
     if not max_act_tokens:
         return None
@@ -353,7 +342,7 @@ def _positional_label(
     position_std: float,
     max_tokens: int = MAX_TOKENS_PER_SEQ,
 ) -> Optional[Tuple[str, str]]:
-    """Classify by positional firing pattern. Returns (label, confidence) or None."""
+    """classify by positional firing pattern. returns (label, confidence) or None."""
     if position_mean == 0.0 and position_std == 0.0:
         return None
     if position_std > 38:
@@ -377,8 +366,8 @@ def _positional_label(
 
 def heuristic_label_feature(feature: Dict[str, Any]) -> Optional[LabeledFeature]:
     """
-    Try to label a feature using rule-based heuristics (no API).
-    Returns LabeledFeature if any heuristic fires, else None.
+    try to label a feature using rule-based heuristics (no API).
+    returns LabeledFeature if any heuristic fires, else None.
     """
     if feature.get("frequency", 0) < 1e-6:
         return None
@@ -430,23 +419,21 @@ def heuristic_label_feature(feature: Dict[str, Any]) -> Optional[LabeledFeature]
     return None
 
 
-# =============================================================================
-# Feature Labeling Logic (Batched LLM Calls)
-# =============================================================================
+# feature labeling logic (batched LLM calls)
 
-LLM_BATCH_SIZE = 30   # smaller batches → better attention per feature
+LLM_BATCH_SIZE = 30   # smaller batches means better attention per feature
 
 
 def extract_feature_tokens(feature: Dict[str, Any]) -> tuple:
     """
-    Extract MaxAct and VocabProj token lists.
+    extract maxact and vocabproj token lists.
 
-    MaxAct sampling strategy (EleutherAI arXiv:2410.13928):
-    Show examples from DIFFERENT activation quantiles, not just the top tokens.
-    This helps the labeling model understand what the feature truly detects
-    vs what appears only at extreme activation levels.
+    maxact sampling strategy (EleutherAI arXiv:2410.13928):
+    show examples from different activation quantiles, not just the top tokens.
+    this helps the labeling model understand what the feature truly detects
+    vs what only appears at extreme activation levels.
 
-    With 10 stored examples (sorted descending by activation), we pick:
+    with 10 stored examples (sorted descending by activation), we pick:
       - indices 0-3  (top tier)
       - indices 5-6  (mid tier)
       - indices 8-9  (lower tier, still positive activations)
@@ -454,7 +441,7 @@ def extract_feature_tokens(feature: Dict[str, Any]) -> tuple:
     all_items = feature.get("max_activating_tokens", [])
     n = len(all_items)
 
-    # Quantile sampling across the stored examples
+    # quantile sampling across the stored examples
     indices = []
     if n > 0:
         indices += list(range(min(4, n)))                             # top 4
@@ -463,7 +450,7 @@ def extract_feature_tokens(feature: Dict[str, Any]) -> tuple:
     if n > 8:
         indices += list(range(8, min(10, n)))                         # lower 2
 
-    # Deduplicate while preserving order
+    # deduplicate while preserving order
     seen = set()
     sampled = []
     for i in indices:
@@ -492,14 +479,14 @@ def extract_feature_tokens(feature: Dict[str, Any]) -> tuple:
 
 def build_batch_prompt(features_batch: List[Dict[str, Any]]) -> str:
     """
-    Build a labeling prompt that shows activation strengths prominently and
+    build a labeling prompt that shows activation strengths prominently and
     samples from quantiles (not just top tokens) for better generalisation.
 
-    Key changes from previous version:
-    - Explicitly tells gpt-4o-mini the model is Llama 3.2 1B Instruct on medical chat data
-    - Shows activation magnitude alongside context (not just token string)
-    - Samples from top/mid/low tiers to reveal the feature's true range
-    - No chain-of-thought in reasoning field (CoT doesn't improve quality per arXiv:2410.13928)
+    key design choices:
+    - explicitly tells gpt-4o-mini the model is llama 3.2 1b instruct on medical chat data
+    - shows activation magnitude alongside context (not just token string)
+    - samples from top/mid/low tiers to reveal the feature's true range
+    - no chain-of-thought in reasoning field (CoT doesn't improve quality per arXiv:2410.13928)
     """
     features_text = ""
     for feature in features_batch:
@@ -507,10 +494,10 @@ def build_batch_prompt(features_batch: List[Dict[str, Any]]) -> str:
 
         max_act_parts = []
         for tok, act, ctx in max_act_tokens:
-            # Truncate context to a short readable snippet around the trigger
+            # truncate context to a short snippet around the trigger token
             ctx_snippet = ""
             if ctx:
-                # Find [TOKEN] marker and show ±30 chars
+                # find [TOKEN] marker and show +/- 30 chars
                 m = re.search(r"\[([^\]]+)\]", ctx)
                 if m:
                     start = max(0, m.start() - 30)
@@ -594,9 +581,7 @@ def parse_batch_response(response: str, features_batch: List[Dict]) -> List[tupl
     return results
 
 
-# =============================================================================
-# Combined Labeling Pipeline
-# =============================================================================
+# combined labeling pipeline
 
 def label_features(
     features: List[Dict],
@@ -611,18 +596,18 @@ def label_features(
     no_heuristic: bool = False,
 ) -> List[LabeledFeature]:
     """
-    Label features using heuristics first, then gpt-4o-mini for the rest.
+    label features using heuristics first, then gpt-4o-mini for the rest.
 
-    Heuristics cover: punctuation, digits, special tokens, positional.
-    They run on ALL features with no frequency filter and are always included
-    in the output JSON (previously they were being lost due to a save bug — fixed).
+    heuristics cover: punctuation, digits, special tokens, positional.
+    they run on all features with no frequency filter and are always included
+    in the output json (previously they were being lost due to a save bug - fixed).
 
     gpt-4o-mini runs on quality-filtered semantic candidates not already claimed.
     gpt-4o-mini labels win if both methods produce a result for the same feature.
     """
     print(f"\nTotal features available: {len(features)}")
 
-    # ── Step 1: Heuristic labeling — all features, no filter ─────────────────
+    # step 1: heuristic labeling, all features, no filter
     heuristic_labeled: Dict[int, LabeledFeature] = {}
 
     if not no_heuristic:
@@ -643,7 +628,7 @@ def label_features(
             _preview_features(features, min_freq, max_freq, no_filter)
         return list(heuristic_labeled.values())
 
-    # ── Step 2: LLM semantic labeling — quality-filtered, skip heuristic hits
+    # step 2: LLM semantic labeling, quality-filtered, skip heuristic hits
     if not os.environ.get("OPENAI_API_KEY"):
         print("\nNo OPENAI_API_KEY found — skipping semantic labeling.")
         return list(heuristic_labeled.values())
@@ -707,7 +692,7 @@ def label_features(
     print(f"\n  gpt-4o-mini labeled: {len(llm_labeled)} features ({label_rate:.1f}% label rate)")
     print(f"  Unlabeled (not monosemantic): {unlabeled_count}")
 
-    # ── Merge: gpt-4o-mini takes priority over heuristic for same feature index ────
+    # merge: gpt-4o-mini takes priority over heuristic for the same feature index
     llm_indices = {lf.index for lf in llm_labeled}
     final = [lf for lf in heuristic_labeled.values() if lf.index not in llm_indices]
     final.extend(llm_labeled)
@@ -733,12 +718,10 @@ def _preview_features(features, min_freq, max_freq, no_filter):
               f"{[t for t, _, _ in max_act[:3]]}")
 
 
-# =============================================================================
-# Save & Print
-# =============================================================================
+# save and print
 
 def save_labeled_features(labeled_features: List[LabeledFeature], output_path: Path):
-    """Save labeled features to JSON, sorted by quality score descending."""
+    """save labeled features to json, sorted by quality score descending."""
     sorted_features = sorted(labeled_features, key=lambda f: f.quality_score, reverse=True)
 
     data = []
@@ -798,9 +781,7 @@ def print_labeled_features(labeled_features: List[LabeledFeature]):
                 print(f"                  → {f.reasoning[:70]}")
 
 
-# =============================================================================
-# Main
-# =============================================================================
+# main
 
 def main():
     parser = argparse.ArgumentParser(description="Label SAE features using OpenAI + heuristics")
@@ -818,7 +799,7 @@ def main():
                         help=f"Features per gpt-4o-mini API call (default: {LLM_BATCH_SIZE})")
     parser.add_argument("--layer", type=int, default=TARGET_LAYER,
                         help=(
-                            "Which layer's features to label (default: 8). "
+                            "Which layer's features to label (default: 12). "
                             "Resolves to medical_outputs/layer_N/ for multi-layer runs, "
                             "or medical_outputs/ for the legacy single-layer layout."
                         ))
@@ -831,7 +812,7 @@ def main():
                         help="Disable quality filter for gpt-4o-mini candidates")
     args = parser.parse_args()
 
-    # Resolve per-layer directory (mirrors the logic in main.py and server.py)
+    # resolve per-layer directory (same logic as main.py and server.py)
     layer_subdir = MEDICAL_OUTPUT_DIR / f"layer_{args.layer}"
     output_dir = layer_subdir if layer_subdir.exists() else MEDICAL_OUTPUT_DIR
     features_path = output_dir / "features.json"

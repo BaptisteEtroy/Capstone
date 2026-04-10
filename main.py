@@ -29,7 +29,7 @@ from collections import Counter
 
 from transformer_lens import HookedTransformer
 
-# Import all config and shared classes
+# grab everything we need from config
 from config import (
     MODEL_NAME, D_MODEL, TARGET_LAYER, HOOK_TYPE,
     LEARNING_RATE, NUM_EPOCHS, BATCH_SIZE, NUM_SAMPLES,
@@ -40,9 +40,7 @@ from config import (
 from dataset import stream_medical_texts
 
 
-# =============================================================================
-# Model Loading & Activation Collection
-# =============================================================================
+# model loading and activation collection
 
 
 def load_model(device: Optional[str] = None) -> HookedTransformer:
@@ -54,8 +52,8 @@ def load_model(device: Optional[str] = None) -> HookedTransformer:
     return model
 
 
-# Llama 3.2 special token IDs — excluded from MaxAct analysis.
-# These structural tokens fire based on format, not semantics, and contaminate labeling.
+# special token IDs to exclude from maxact analysis
+# these fire on chat format structure, not real semantics, so they'd contaminate labeling
 # 128000=<|begin_of_text|>  128001=<|end_of_text|>  128006=<|start_header_id|>
 # 128007=<|end_header_id|>  128008=<|eot_id|> (some configs)  128009=<|eot_id|>
 _LLAMA_SPECIAL_IDS = {128000, 128001, 128006, 128007, 128008, 128009}
@@ -74,16 +72,16 @@ def collect_activations(
     layer: int = TARGET_LAYER,
 ) -> tuple:
     """
-    Collect residual stream activations from the given layer using medical datasets.
+    collect residual stream activations from the given layer using medical datasets.
 
-    Saves activation chunks to disk to stay within RAM limits.
-    Token IDs and source IDs are kept in memory (small) for MaxAct context building.
+    saves activation chunks to disk to stay within ram limits.
+    token IDs and source IDs are kept in memory (small) for maxact context building.
 
-    Returns:
-        token_ids   : torch.Tensor [n_tokens]  — all token IDs in RAM
-        chunk_files : List[Path]               — activation chunk paths on disk
-        source_ids  : torch.Tensor [n_tokens]  — index into source_list per token
-        source_list : List[str]                — source ID strings
+    returns:
+        token_ids   : torch.Tensor [n_tokens]  - all token IDs in RAM
+        chunk_files : List[Path]               - activation chunk paths on disk
+        source_ids  : torch.Tensor [n_tokens]  - index into source_list per token
+        source_list : List[str]                - source ID strings
     """
     import gc
 
@@ -95,7 +93,7 @@ def collect_activations(
 
     all_activations = []
     all_token_ids = []
-    all_source_idxs = []   # int index per token → source_list
+    all_source_idxs = []   # int index per token into source_list
     source_list = []
     source_name_to_idx: Dict[str, int] = {}
 
@@ -121,7 +119,7 @@ def collect_activations(
             _, cache = model.run_with_cache(tokens, names_filter=[hook_point])
             acts_batch = cache[hook_point].cpu()  # [batch, seq_len, d_model]
 
-            # Filter out padding positions per sequence (Llama uses <|eot_id|> as pad)
+            # skip padding tokens (llama uses eot_id as padding)
             pad_id = model.tokenizer.pad_token_id or model.tokenizer.eos_token_id
             for i, src_id in enumerate(batch_sources):
                 real_mask = tokens[i].cpu() != pad_id
@@ -142,7 +140,7 @@ def collect_activations(
             batch_texts = []
             batch_sources = []
 
-        # Flush chunk to disk
+        # flush to disk periodically so we don't run out of ram
         if count % chunk_size == 0 and count > 0 and all_activations:
             chunk_acts = torch.cat(all_activations, dim=0).half()  # float16 to save disk space
             chunk_path = chunks_dir / f"chunk_{chunk_idx}.pt"
@@ -157,7 +155,7 @@ def collect_activations(
         if count >= num_samples:
             break
 
-    # Process remaining batch
+    # process any leftover samples that didn't fill a full batch
     if batch_texts:
         tokens = model.to_tokens(batch_texts)
         if tokens.shape[1] > max_tokens:
@@ -181,7 +179,7 @@ def collect_activations(
 
     pbar.close()
 
-    # Save final chunk
+    # save whatever's left in the final chunk
     if all_activations:
         chunk_acts = torch.cat(all_activations, dim=0).half()  # float16 to save disk space
         chunk_path = chunks_dir / f"chunk_{chunk_idx}.pt"
@@ -200,9 +198,7 @@ def collect_activations(
     return token_ids, chunk_files, source_ids, source_list
 
 
-# =============================================================================
-# Training
-# =============================================================================
+# training
 
 
 def train_sae(
@@ -214,10 +210,10 @@ def train_sae(
     device: Optional[str] = None,
 ) -> Dict[str, List[float]]:
     """
-    Train the TopK SAE on chunked activations stored on disk.
+    train the topk sae on chunked activations stored on disk.
 
-    Loads one chunk at a time — peak RAM = one chunk + SAE weights.
-    Chunks are shuffled each epoch for better training diversity.
+    loads one chunk at a time so peak ram = one chunk + sae weights.
+    chunks are shuffled each epoch for better training diversity.
     """
     import gc
     import random
@@ -225,7 +221,7 @@ def train_sae(
     device = device or get_device()
     sae = sae.to(device)
 
-    # Estimate total steps for scheduler (use first chunk size as proxy)
+    # estimate total steps for the lr scheduler using the first chunk size as a proxy
     first_chunk = torch.load(chunk_files[0])  # No .float() needed, just checking shape
     steps_per_chunk = (first_chunk.shape[0] + batch_size - 1) // batch_size
     del first_chunk
@@ -244,9 +240,8 @@ def train_sae(
                "entropy_per_epoch": [], "entropy_norm_per_epoch": []}
     global_step = 0
 
-    # EMA of per-feature firing rate — tracks which features are alive over time.
-    # alpha=0.99: slow decay so the estimate reflects hundreds of batches, not just the last one.
-    # A feature is "dead" when its EMA drops below 1e-5 (fires < 0.001% of tokens on average).
+    # ema of per-feature firing rate, slow decay (0.99) so it reflects many batches not just recent ones
+    # feature is "dead" when ema drops below 1e-5 (fires basically never)
     EMA_ALPHA = 0.99
     ema_freq = torch.zeros(sae.d_hidden, device=device)
 
@@ -254,7 +249,7 @@ def train_sae(
         epoch_loss = 0.0
         epoch_steps = 0
 
-        # Shuffle chunk order each epoch
+        # shuffle chunk order so training sees different sequences each epoch
         shuffled_chunks = chunk_files.copy()
         random.shuffle(shuffled_chunks)
 
@@ -275,7 +270,7 @@ def train_sae(
                 scheduler.step()
                 sae._normalize_decoder()
 
-                # Update EMA firing rate: fraction of tokens in this batch that fired each feature
+                # update ema: fraction of tokens in this batch that fired each feature
                 with torch.no_grad():
                     batch_freq = (output.hidden > 0).float().mean(dim=0)
                     ema_freq = EMA_ALPHA * ema_freq + (1 - EMA_ALPHA) * batch_freq
@@ -293,16 +288,14 @@ def train_sae(
             del activations, dataset, loader
             gc.collect()
 
-        # End-of-epoch metrics
+        # end of epoch stats
         epoch_dead = int((ema_freq < 1e-5).sum().item())
         history["dead_features_per_epoch"].append(epoch_dead)
         history["epoch_losses"].append(epoch_loss / epoch_steps)
 
-        # Shannon entropy of feature usage distribution (computed from EMA firing rates).
-        # H = -sum(p_i * log2(p_i)) over alive features only (dead features contribute 0).
-        # Tracks whether the SAE maintains a diverse, uniform spread of feature usage or
-        # collapses toward a small set of dominant features.
-        # entropy_norm: H / log2(d_hidden) → 0 (one feature dominates) to 1 (perfectly uniform).
+        # shannon entropy of feature usage (from ema firing rates)
+        # low entropy means the sae is collapsing to a few dominant features
+        # entropy_norm divides by log2(d_hidden) so 0 = one feature dominates, 1 = perfectly uniform
         freq_norm = ema_freq / (ema_freq.sum() + 1e-8)
         alive_probs = freq_norm[freq_norm > 0]
         entropy_bits = -(alive_probs * alive_probs.log2()).sum().item()
@@ -318,19 +311,17 @@ def train_sae(
     return history
 
 
-# =============================================================================
-# Feature Analysis (Input-centric + Output-centric methods from lit review)
-# =============================================================================
+# feature analysis (input-centric + output-centric methods from lit review)
 
 def token_entropy(max_act_examples: List[MaxActExample]) -> float:
     """
-    Shannon entropy (bits) of the MaxAct token distribution for one feature.
+    shannon entropy (bits) of the maxact token distribution for one feature.
 
-    Low entropy  → monosemantic: feature fires on a tight cluster of similar tokens.
-    High entropy → polysemantic: feature fires broadly across unrelated tokens.
+    low entropy means the feature fires on a tight cluster of similar tokens (monosemantic).
+    high entropy means it fires broadly on unrelated tokens (polysemantic).
 
-    Tokens are lowercased and stripped so surface variants ("The"/"the") don't
-    artificially inflate diversity.  Returns 0.0 for features with ≤1 example.
+    tokens are lowercased and stripped so surface variants like "The"/"the" don't
+    artificially inflate diversity. returns 0.0 for features with 1 or fewer examples.
     """
     import math
 
@@ -344,16 +335,14 @@ def token_entropy(max_act_examples: List[MaxActExample]) -> float:
 
 def source_breakdown(max_act_examples: List[MaxActExample], all_sources: List[str]) -> Dict[str, float]:
     """
-    Fraction of a feature's MaxAct examples that come from each source dataset.
+    fraction of a feature's maxact examples that come from each source dataset.
 
     source_id strings are in the form "dataset:doc_index" (e.g. "medmcqa:54").
-    This function aggregates by the dataset prefix (the part before the colon)
-    so the result is always a 3-key dict over {medmcqa, pubmed_qa, pubmed_abs}.
+    aggregates by the dataset prefix so the result maps to {medmcqa, pubmed_qa, pubmed_abs}.
 
-    Returns a sparse dict — only datasets that actually appear are included.
-    An empty dict means source tracking was unavailable.
+    returns a sparse dict of only datasets that actually appear.
+    empty dict means source tracking was unavailable.
     """
-    # Aggregate by dataset prefix, ignoring the per-document index
     counts: Dict[str, int] = Counter()
     for ex in max_act_examples:
         if ex.source_id:
@@ -367,23 +356,23 @@ def source_breakdown(max_act_examples: List[MaxActExample], all_sources: List[st
 
 def build_context_string(global_token_idx: int, token_ids: torch.Tensor, tokenizer, window: int = 50) -> str:
     """
-    Build a ±window token context string with [TOKEN] marker around the trigger token.
+    build a +/- window token context string with [TOKEN] marker around the trigger token.
 
-    Respects document boundaries: the window is clipped at the nearest
+    respects document boundaries: the window is clipped at the nearest
     <|begin_of_text|> token (ID 128000) on either side so contexts never
     bleed across unrelated documents.
     """
     n = len(token_ids)
-    bos_id = 128000  # <|begin_of_text|> for Llama 3.2
+    bos_id = 128000  # <|begin_of_text|> for llama 3.2
 
-    # Scan left for the nearest document boundary
+    # scan left to find the nearest document boundary
     start = max(0, global_token_idx - window)
     for pos in range(global_token_idx - 1, start - 1, -1):
         if token_ids[pos].item() == bos_id:
             start = pos + 1  # start after the BOS, not at it
             break
 
-    # Scan right for the nearest document boundary
+    # scan right to find the nearest document boundary
     end = min(n, global_token_idx + window + 1)
     for pos in range(global_token_idx + 1, end):
         if token_ids[pos].item() == bos_id:
@@ -407,9 +396,9 @@ def _context_tokens_for_example(
     window: int = 50,
 ) -> tuple:
     """
-    Return (context_token_ids [seq], within_context_position) for a MaxAct example.
-    Mirrors build_context_string boundary logic exactly — respects BOS (ID 128000).
-    Used by TokenChange to reconstruct the forward-pass context without re-tokenizing.
+    return (context_token_ids [seq], within_context_position) for a maxact example.
+    mirrors build_context_string boundary logic exactly - respects BOS (ID 128000).
+    used by tokenchange to reconstruct the forward-pass context without re-tokenizing.
     """
     n = len(token_ids)
     bos_id = 128000
@@ -444,16 +433,16 @@ def compute_token_change_for_feature(
     top_k: int = 10,
 ) -> Optional[Dict]:
     """
-    Causal output-centric analysis. Inject feat_idx's decoder direction at `layer`
-    via a TransformerLens hook and measure how the next-token distribution shifts at
-    the active token position — averaged across up to 5 MaxAct contexts.
+    causal output-centric analysis. inject feat_idx's decoder direction at `layer`
+    via a transformerlens hook and measure how the next-token distribution shifts at
+    the active token position, averaged across up to 5 maxact contexts.
 
-    Returns None if no valid examples could be processed.
+    returns None if no valid examples could be processed.
 
-    Why this is better than VocabProj at layer 12:
-    - VocabProj: decoder_col @ W_U (single linear step, ignores 4 downstream layers)
-    - TokenChange: real forward pass through all remaining layers + RMSNorm + W_U
-    Dead features are naturally filtered: they produce low, inconsistent KL across
+    why this is better than vocabproj at layer 12:
+    - vocabproj: decoder_col @ W_U (single linear step, ignores 4 downstream layers)
+    - tokenchange: real forward pass through all remaining layers + rmsnorm + W_U
+    dead features are naturally filtered: they produce low, inconsistent kl across
     contexts, so token_change_kl_std / token_change_kl will be high.
     """
     examples = [e for e in max_act_examples[:5] if e.global_token_idx >= 0]
@@ -474,7 +463,7 @@ def compute_token_change_for_feature(
 
         ctx_tensor = context.unsqueeze(0).to(device)  # [1, seq]
 
-        # Closure captures current `position` correctly via default arg
+        # default arg captures current `position` correctly in the closure
         def inject_fn(activation, hook, _pos=position):
             activation[:, _pos, :] = activation[:, _pos, :] + scale * decoder_dir
             return activation
@@ -527,10 +516,10 @@ def analyze_features(
     layer: int = TARGET_LAYER,
 ) -> List[FeatureInfo]:
     """
-    Analyze learned features using combined input/output-centric methods.
+    analyze learned features using combined input/output-centric methods.
 
-    Processes activation chunks from disk one at a time — no full tensor in RAM.
-    Token IDs stay in RAM (small) for context string building.
+    processes activation chunks from disk one at a time so there's no full tensor in ram.
+    token IDs stay in ram (small) for context string building.
     """
     import gc
 
@@ -543,9 +532,7 @@ def analyze_features(
 
     decoder_weights = sae.decoder.weight.detach()  # [d_model, d_hidden]
 
-    # =========================================================================
-    # Pass 1: Compute basic statistics — one chunk at a time
-    # =========================================================================
+    # pass 1: compute basic statistics, one chunk at a time
     print("\n  Pass 1: Computing feature statistics...")
 
     n_tokens = 0
@@ -554,7 +541,7 @@ def analyze_features(
     feature_max = torch.full((sae.d_hidden,), float('-inf'))
 
     for chunk_path in tqdm(chunk_files, desc="  Stats (chunks)"):
-        chunk = torch.load(chunk_path).float()  # Convert float16 back to float32
+        chunk = torch.load(chunk_path).float()  # convert float16 back to float32
         for i in range(0, len(chunk), BATCH_SIZE):
             batch = chunk[i:i+BATCH_SIZE].to(device)
             with torch.no_grad():
@@ -569,15 +556,13 @@ def analyze_features(
     feature_freq = feature_count / n_tokens
     feature_mean = feature_sum / n_tokens
 
-    # =========================================================================
-    # Pass 2: MaxAct — running top-k across all chunks
-    # =========================================================================
+    # pass 2: maxact - running top-k across all chunks
     print("\n  Pass 2: Computing MaxAct for top features...")
 
-    # Exclude all Llama 3.2 structural special tokens from MaxAct.
-    # These fire based on chat-template position, not semantics.
+    # exclude all llama structural special tokens from maxact
+    # they fire on chat template position, not actual semantics
     special_ids_set = _LLAMA_SPECIAL_IDS.copy()
-    # Also add any additional special tokens reported by the tokenizer
+    # also add any extra special tokens from the tokenizer
     if model.tokenizer.all_special_ids:
         special_ids_set.update(model.tokenizer.all_special_ids)
     print(f"    (Excluding {len(special_ids_set)} special token IDs from MaxAct)")
@@ -597,9 +582,9 @@ def analyze_features(
     running_vals = torch.full((topk_per_feature, n_features), float('-inf'))
     running_idxs = torch.zeros(topk_per_feature, n_features, dtype=torch.long)
 
-    global_offset = 0  # track absolute token index across chunks
+    global_offset = 0  # track absolute position across chunks
     for chunk_path in tqdm(chunk_files, desc="  MaxAct (chunks)"):
-        chunk = torch.load(chunk_path).float()  # Convert float16 back to float32
+        chunk = torch.load(chunk_path).float()  # convert float16 back to float32
 
         for i in range(0, len(chunk), BATCH_SIZE):
             batch = chunk[i:i+BATCH_SIZE].to(device)
@@ -630,8 +615,8 @@ def analyze_features(
         del chunk
         gc.collect()
 
-    # Compute source-start positions: for each source index, what is the global
-    # token offset where that source begins? Used for document-relative positions.
+    # for each source index, find the global token offset where that source begins
+    # used to compute document-relative token positions
     source_start_positions: Dict[int, int] = {}
     if source_ids is not None:
         prev_sid = -1
@@ -643,7 +628,7 @@ def analyze_features(
 
     max_act_values = {}
     max_act_indices = {}
-    max_act_positions = {}  # (mean, std) of token position-within-source-document
+    max_act_positions = {}  # (mean, std) of token position within source document
     for f_pos, feat_idx in enumerate(top_feature_indices):
         max_act_values[feat_idx] = running_vals[:, f_pos]
         max_act_indices[feat_idx] = running_idxs[:, f_pos]
@@ -652,7 +637,7 @@ def analyze_features(
         if valid_mask.any():
             global_idxs = running_idxs[:, f_pos][valid_mask]
             if source_ids is not None and source_start_positions:
-                # Position = global_idx - start_of_that_token's_source_document
+                # position = global_idx minus the start of that token's source document
                 positions = []
                 for gidx in global_idxs.tolist():
                     sid = source_ids[gidx].item() if gidx < len(source_ids) else 0
@@ -660,20 +645,17 @@ def analyze_features(
                     positions.append(float(gidx - src_start))
                 positions_t = torch.tensor(positions)
             else:
-                # Fallback: position within the max_tokens window (approximate)
+                # fallback: approximate position within max_tokens window
                 positions_t = global_idxs.float() % max_tokens
             pos_mean = positions_t.mean().item()
             pos_std  = positions_t.std().item() if valid_mask.sum() > 1 else 0.0
         else:
             pos_mean, pos_std = 0.0, 0.0
         max_act_positions[feat_idx] = (pos_mean, pos_std)
-    
-    # =========================================================================
-    # Pass 3: VocabProj — project decoder vectors onto vocabulary
-    # =========================================================================
+
+    # pass 3: vocabproj - project decoder vectors onto vocabulary
     print("  Pass 3: Computing VocabProj (output-centric)...")
-    # Compute in CPU chunks to avoid OOM: [d_hidden, vocab_size] at fp32 is ~8 GB for d_hidden=16384.
-    # Process FEAT_CHUNK features at a time instead of the full matrix at once.
+    # process in cpu chunks to avoid oom: [d_hidden, vocab_size] at fp32 is ~8 GB for d_hidden=16384
     unembed_cpu = model.W_U.detach().cpu()       # [d_model, vocab_size]
     decoder_cpu = decoder_weights.cpu()           # [d_model, d_hidden]
     FEAT_CHUNK = 512
@@ -681,9 +663,9 @@ def analyze_features(
     all_top_indices = []
     for chunk_start in tqdm(range(0, sae.d_hidden, FEAT_CHUNK), desc="  VocabProj (chunks)"):
         chunk_end = min(chunk_start + FEAT_CHUNK, sae.d_hidden)
-        # [chunk_size, d_model] @ [d_model, vocab_size] → [chunk_size, vocab_size]
+        # [chunk_size, d_model] @ [d_model, vocab_size] -> [chunk_size, vocab_size]
         chunk_logits = decoder_cpu[:, chunk_start:chunk_end].T @ unembed_cpu
-        # Mean-subtract: removes common tokens predicted everywhere (Gao et al. 2024)
+        # mean-subtract to remove common tokens predicted everywhere (Gao et al. 2024)
         chunk_logits = chunk_logits - chunk_logits.mean(dim=-1, keepdim=True)
         chunk_top_vals, chunk_top_idx = chunk_logits.topk(top_k, dim=-1)
         all_top_values.append(chunk_top_vals)
@@ -695,12 +677,9 @@ def analyze_features(
 
     tokenizer = model.tokenizer
 
-    # =========================================================================
-    # Pass 4: TokenChange — causal output-centric
-    # Inject each feature's decoder direction at `layer` via a hook and measure
-    # how the next-token distribution shifts at the active token position.
-    # Uses up to 5 MaxAct contexts per feature; skips dead features (no MaxAct).
-    # =========================================================================
+    # pass 4: tokenchange - causal output-centric
+    # inject each feature's decoder direction at `layer` and measure the next-token shift
+    # uses up to 5 maxact contexts per feature, skips dead features with no maxact examples
     print("\n  Pass 4: Computing TokenChange (causal output-centric)...")
     token_change_results: Dict[int, Optional[Dict]] = {}
     for feat_idx in tqdm(top_feature_indices, desc="  TokenChange"):
@@ -708,7 +687,7 @@ def analyze_features(
             token_change_results[feat_idx] = None
             continue
 
-        # Build lightweight stubs — only global_token_idx and activation are used
+        # build lightweight stubs using only global_token_idx and activation
         stubs = []
         for sp in max_act_values[feat_idx].argsort(descending=True):
             act_val = max_act_values[feat_idx][sp].item()
@@ -727,23 +706,20 @@ def analyze_features(
             mean_activation=feature_mean[feat_idx].item(),
         )
 
-    # =========================================================================
-    # Build FeatureInfo for top features
-    # =========================================================================
+    # build featureinfo for all top features
     print("\n  Building feature analysis...")
-    
+
     features_info = []
     for feat_idx in tqdm(top_feature_indices, desc="  Features"):
-        # Sort MaxAct results by activation value (descending)
+        # sort maxact results by activation value descending
         sorted_order = max_act_values[feat_idx].argsort(descending=True)
-        
-        # Build MaxAct examples (input-centric: what tokens trigger this feature).
-        # Three deduplication layers:
-        #   1. Skip Llama special tokens (structural noise)
-        #   2. Skip duplicate token strings (same surface form)
-        #   3. Skip duplicate context prefixes (same document flooding multiple slots)
-        #   4. Cap examples per source document (max 2) to prevent outlier docs
-        #      from consuming all top-k slots.
+
+        # build maxact examples (what tokens trigger this feature)
+        # deduplication at 3 levels to avoid redundant examples:
+        #   1. skip llama special tokens (structural noise)
+        #   2. skip duplicate token strings (same surface form)
+        #   3. skip duplicate context prefixes (same document section seen multiple times)
+        #   4. cap examples per source doc (max 2) so one outlier doc doesn't take all slots
         max_act_examples = []
         seen_tokens: set = set()
         seen_ctx_keys: set = set()
@@ -758,13 +734,13 @@ def analyze_features(
             token_global_idx = max_act_indices[feat_idx][sort_pos].item()
             tok_id = token_ids[token_global_idx].item()
 
-            # Skip all structural special tokens
+            # skip structural special tokens
             if tok_id in special_ids_set:
                 continue
 
             tok_str = tokenizer.decode([tok_id])
 
-            # Skip duplicate token strings
+            # skip duplicate token strings
             if tok_str in seen_tokens:
                 continue
 
@@ -773,13 +749,13 @@ def analyze_features(
                 src_idx = source_ids[token_global_idx].item()
                 src_id = source_list[src_idx] if src_idx < len(source_list) else ""
 
-            # Cap per-source examples to prevent outlier documents dominating
+            # cap per-source examples to prevent one outlier document dominating
             if source_example_count.get(src_id, 0) >= MAX_EXAMPLES_PER_SOURCE:
                 continue
 
             ctx = build_context_string(token_global_idx, token_ids, tokenizer)
 
-            # Skip duplicate context windows (same document section seen before)
+            # skip duplicate context windows (same document section seen before)
             ctx_key = ctx[:100]
             if ctx_key in seen_ctx_keys:
                 continue
@@ -796,8 +772,8 @@ def analyze_features(
                 global_token_idx=token_global_idx,
                 source_id=src_id,
             ))
-        
-        # VocabProj: tokens this feature promotes (output-centric)
+
+        # vocabproj: tokens this feature promotes (output-centric)
         vocab_tokens = []
         vocab_logit_values = []
         for k in range(min(top_k, 10)):
@@ -806,7 +782,7 @@ def analyze_features(
             logit_val = top_vocab_values[feat_idx, k].item()
             vocab_tokens.append(tok_str)
             vocab_logit_values.append(logit_val)
-        
+
         pos_mean, pos_std = max_act_positions.get(feat_idx, (0.0, 0.0))
         tc = token_change_results.get(feat_idx) or {}
         info = FeatureInfo(
@@ -828,7 +804,7 @@ def analyze_features(
             token_change_n_contexts=tc.get("n_contexts", 0),
         )
         features_info.append(info)
-    
+
     return features_info
 
 
@@ -843,7 +819,7 @@ def save_results(
     source_list: Optional[List[str]] = None,
     layer: int = TARGET_LAYER,
 ):
-    """Save all results to disk. Processes chunks one at a time — no OOM."""
+    """save all results to disk, processing chunks one at a time to avoid oom."""
     import gc
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -865,23 +841,22 @@ def save_results(
         json.dump(chunk_manifest, f)
     print(f"  Saved chunk manifest: {len(chunk_files)} chunks")
 
-    # Summary stats — one chunk at a time
+    # summary stats, one chunk at a time
     device = get_device()
     sae = sae.to(device).eval()
 
     n_tokens = 0
     feature_count = torch.zeros(sae.d_hidden)
     total_l0 = 0.0
-    # Explained variance accumulators (single-pass via E[x²] - E[x]²).
-    # Summed over tokens, averaged at the end.  All in float64 to avoid
-    # catastrophic cancellation when subtracting two large numbers.
+    # single-pass explained variance accumulators using E[x^2] - E[x]^2
+    # keeping these in float64 on cpu prevents catastrophic cancellation with float32
     sum_x   = torch.zeros(sae.d_model, dtype=torch.float64)
     sum_x2  = torch.zeros(sae.d_model, dtype=torch.float64)
-    sum_res2 = 0.0   # sum of ||x - x̂||² over all tokens
+    sum_res2 = 0.0   # sum of ||x - x_hat||^2 over all tokens
 
     print("  Computing summary statistics (chunked)...")
     for chunk_path in tqdm(chunk_files, desc="  Stats"):
-        chunk = torch.load(chunk_path).float()  # Convert float16 back to float32
+        chunk = torch.load(chunk_path).float()  # convert float16 back to float32
         for i in range(0, len(chunk), BATCH_SIZE):
             batch = chunk[i:i+BATCH_SIZE].to(device)
             with torch.no_grad():
@@ -892,8 +867,7 @@ def save_results(
             feature_count += (features > 0).float().sum(dim=0)
             total_l0 += (features > 0).float().sum(dim=-1).sum().item()
             n_tokens += batch.shape[0]
-            # Accumulate for explained variance (move to CPU before float64 cast —
-            # MPS does not support float64, so the cast must happen on CPU)
+            # move to cpu before float64 cast since mps doesn't support float64
             b = batch.cpu().double()
             sum_x   += b.sum(dim=0)
             sum_x2  += (b ** 2).sum(dim=0)
@@ -905,14 +879,14 @@ def save_results(
     dead_features = (feature_freq < 1e-5).sum().item()
     avg_l0 = total_l0 / n_tokens
 
-    # Explained variance = 1 - Var(residual) / Var(x)
-    # Var(x) per dimension = E[x²] - E[x]²; total = sum over dimensions
+    # explained variance = 1 - Var(residual) / Var(x)
+    # var per dimension = E[x^2] - E[x]^2, summed across dimensions
     mean_x      = sum_x / n_tokens
     var_x_total = float((sum_x2 / n_tokens - mean_x ** 2).sum().item())
     var_res     = sum_res2 / n_tokens          # mean per-token residual variance
     explained_variance = 1.0 - (var_res / var_x_total) if var_x_total > 0 else 0.0
     explained_variance = round(float(explained_variance), 6)
-    
+
     features_data = [
         {
             "index": f.index,
@@ -947,11 +921,11 @@ def save_results(
     with open(output_dir / "features.json", "w") as f:
         json.dump(features_data, f, indent=2)
     print(f"  Saved feature analysis: {len(features_info)} features")
-    
+
     with open(output_dir / "training_history.json", "w") as f:
         json.dump(history, f, indent=2)
     print(f"  Saved training history")
-    
+
     summary = {
         "model": MODEL_NAME,
         "layer": layer,
@@ -982,19 +956,17 @@ def save_results(
     print(f"{'='*60}")
 
 
-# =============================================================================
-# Cross-Layer Analysis
-# =============================================================================
+# cross-layer analysis
 
 def cross_layer_analysis(layer_dirs: Dict[int, Path]):
     """
-    Compare decoder weight directions across layers to quantify feature evolution.
+    compare decoder weight directions across layers to quantify feature evolution.
 
-    For each pair of trained layers, computes the distribution of maximum cosine
-    similarities between decoder feature directions.  High similarity = the same
-    concept is represented in both layers; low = a layer-specific specialisation.
+    for each pair of trained layers, computes the distribution of maximum cosine
+    similarities between decoder feature directions. high similarity means the same
+    concept is represented in both layers; low means a layer-specific specialization.
 
-    Saves medical_outputs/cross_layer_analysis.json with:
+    saves medical_outputs/cross_layer_analysis.json with:
       - per-pair statistics (mean/median max-sim, shared-feature counts)
       - similarity histograms for plotting
       - top shared features (cosine sim > 0.7) with their indices in each layer
@@ -1006,7 +978,7 @@ def cross_layer_analysis(layer_dirs: Dict[int, Path]):
     print(f"  Layers: {sorted(layer_dirs)}")
     print(f"{'='*60}")
 
-    # Load all available SAEs
+    # load all available saes
     saes: Dict[int, SparseAutoencoder] = {}
     for layer, layer_dir in sorted(layer_dirs.items()):
         sae_path = layer_dir / "sae.pt"
@@ -1023,7 +995,7 @@ def cross_layer_analysis(layer_dirs: Dict[int, Path]):
         return
 
     HIGH_SIM_THRESHOLD = 0.7
-    CHUNK = 512   # rows per matmul chunk — keeps memory bounded
+    CHUNK = 512   # rows per matmul chunk to keep memory bounded
     BIN_EDGES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
     results: Dict = {"layers": sorted(saes.keys()), "pairs": {}}
@@ -1032,8 +1004,7 @@ def cross_layer_analysis(layer_dirs: Dict[int, Path]):
         sae_a = saes[layer_a]
         sae_b = saes[layer_b]
 
-        # Decoder weight: [d_model, d_hidden].  Transpose → [d_hidden, d_model]
-        # so each ROW is one feature's direction in model space.
+        # decoder weight is [d_model, d_hidden], transpose so each row is one feature direction
         W_a = F.normalize(sae_a.decoder.weight.T.float(), dim=-1)  # [n_feat, d_model]
         W_b = F.normalize(sae_b.decoder.weight.T.float(), dim=-1)
 
@@ -1041,7 +1012,7 @@ def cross_layer_analysis(layer_dirs: Dict[int, Path]):
               f"({W_a.shape[0]} × {W_b.shape[0]} features) …")
 
         def _best_matches(src: torch.Tensor, tgt: torch.Tensor):
-            """For each row in src, find max cosine sim to any row in tgt."""
+            """for each row in src, find max cosine sim to any row in tgt."""
             max_sims, max_idxs = [], []
             for i in range(0, src.shape[0], CHUNK):
                 block = src[i:i + CHUNK]          # [chunk, d_model]
@@ -1065,8 +1036,8 @@ def cross_layer_analysis(layer_dirs: Dict[int, Path]):
         shared_count_a2b = int(shared_a2b_mask.sum().item())
         shared_count_b2a = int((sims_b2a > HIGH_SIM_THRESHOLD).sum().item())
 
-        # Collect top shared feature pairs (idx_in_A, idx_in_B, similarity)
-        # Full mapping above threshold (for convergence analysis) — save all, not just top 50
+        # save all shared feature pairs above threshold (not just top 50)
+        # used for convergence analysis downstream
         shared_pairs = []
         if shared_count_a2b > 0:
             shared_indices_a = shared_a2b_mask.nonzero(as_tuple=True)[0].tolist()
@@ -1077,9 +1048,8 @@ def cross_layer_analysis(layer_dirs: Dict[int, Path]):
                     "cosine_similarity": round(float(sims_a2b[idx_a].item()), 4),
                 })
 
-        # Many-to-one convergence: find layer_b features that multiple layer_a features map to.
-        # These are the "convergence points" — a single L(N+1) feature that absorbs several
-        # distinct L(N) features, showing how representations consolidate with depth.
+        # many-to-one convergence: find layer_b features that multiple layer_a features map to
+        # these are "convergence points" where distinct layer_n features consolidate with depth
         from collections import defaultdict as _dd
         target_to_sources: Dict[int, list] = _dd(list)
         for pair in shared_pairs:
@@ -1133,9 +1103,7 @@ def cross_layer_analysis(layer_dirs: Dict[int, Path]):
     print(f"\n  Cross-layer analysis saved → {out_path}")
 
 
-# =============================================================================
-# Main Pipeline
-# =============================================================================
+# main pipeline
 
 def main():
     parser = argparse.ArgumentParser(description="Medical SAE pipeline for Llama 3.2 1B")
@@ -1164,9 +1132,7 @@ def main():
 
     device = args.device or get_device()
 
-    # ------------------------------------------------------------------
-    # --validate-token-change: sanity-check on 10 coherent features
-    # ------------------------------------------------------------------
+    # --validate-token-change: sanity check on 10 coherent features
     if args.validate_token_change:
         layers_val: List[int] = args.layers
         layer_val = layers_val[0]
@@ -1187,7 +1153,7 @@ def main():
         with open(feat_path) as fh:
             all_feats = json.load(fh)
 
-        # Load labeled labels if available
+        # load labels if available
         label_map: Dict[int, str] = {}
         lbl_path = out_dir / "labeled_features.json"
         if lbl_path.exists():
@@ -1195,7 +1161,7 @@ def main():
                 for lf in json.load(fh):
                     label_map[lf["index"]] = lf.get("label", "")
 
-        # Pick top-10 by coherence: enough MaxAct examples + low entropy + alive
+        # pick top-10 by coherence: enough maxact examples + low entropy + alive
         candidates = [
             f for f in all_feats
             if len(f.get("max_activating_tokens", [])) >= 3
@@ -1212,7 +1178,7 @@ def main():
         sae = SparseAutoencoder.load(sae_path, device=device)
         model = load_model(device)
 
-        # Load token_ids for context reconstruction
+        # load token_ids for context reconstruction
         tok_path = out_dir / "token_ids.pt"
         if not tok_path.exists():
             print("[validate] token_ids.pt not found — cannot reconstruct contexts.")
@@ -1250,9 +1216,8 @@ def main():
     num_epochs = 1 if args.quick else NUM_EPOCHS
     layers: List[int] = args.layers
 
-    # Per-layer output directory.
-    # Single-layer default (layer 12) → medical_outputs/  (backward-compatible).
-    # Any other configuration         → medical_outputs/layer_N/
+    # single-layer default (layer 12) goes to medical_outputs/ for backward compat
+    # any other config goes to medical_outputs/layer_N/
     def _layer_dir(layer: int) -> Path:
         if len(layers) == 1 and layer == TARGET_LAYER:
             return MEDICAL_OUTPUT_DIR
@@ -1271,15 +1236,13 @@ def main():
     if len(layers) > 1:
         print(f"  Multi-layer mode: will train {len(layers)} SAEs, then run cross-layer analysis.")
 
-    # -------------------------------------------------------------------------
-    # Phase 1 — Collect activations for every requested layer (model loaded once)
-    # -------------------------------------------------------------------------
+    # phase 1: collect activations for every requested layer (model loaded once)
     print(f"\n{'='*60}")
     print("  Phase 1: Activation Collection")
     print(f"{'='*60}")
 
     model = load_model(device)
-    layer_data: Dict[int, tuple] = {}   # layer → (token_ids, chunk_files, source_ids, source_list)
+    layer_data: Dict[int, tuple] = {}   # layer -> (token_ids, chunk_files, source_ids, source_list)
 
     for layer in layers:
         layer_dir = _layer_dir(layer)
@@ -1310,14 +1273,12 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # -------------------------------------------------------------------------
-    # Phase 2 — Train one SAE per layer (no GPU model needed)
-    # -------------------------------------------------------------------------
+    # phase 2: train one sae per layer (no gpu model needed)
     print(f"\n{'='*60}")
     print("  Phase 2: SAE Training")
     print(f"{'='*60}")
 
-    trained: Dict[int, tuple] = {}   # layer → (sae, history)
+    trained: Dict[int, tuple] = {}   # layer -> (sae, history)
 
     for layer in layers:
         token_ids, chunk_files, source_ids, source_list = layer_data[layer]
@@ -1325,9 +1286,8 @@ def main():
 
         sae = SparseAutoencoder()
 
-        # Initialise b_pre from a sample of real activations (geometric median approx).
-        # This centres the encoder input so pre-activations start near zero — critical
-        # for fast convergence and reducing dead features (Gao et al. 2024).
+        # init b_pre from a sample of real activations (geometric median approximation from Gao et al. 2024)
+        # this centres the encoder input so pre-activations start near zero, which helps a lot with dead features
         print("  Initialising SAE bias from data sample…")
         _init_chunk = torch.load(chunk_files[0])
         _init_sample = _init_chunk[:min(2048, len(_init_chunk))]
@@ -1338,9 +1298,7 @@ def main():
         history = train_sae(sae, chunk_files, num_epochs=num_epochs, device=device)
         trained[layer] = (sae, history)
 
-    # -------------------------------------------------------------------------
-    # Phase 3 — Feature analysis & save (model reloaded once for VocabProj)
-    # -------------------------------------------------------------------------
+    # phase 3: feature analysis and save (model reloaded once for vocabproj)
     print(f"\n{'='*60}")
     print("  Phase 3: Feature Analysis & Save")
     print(f"{'='*60}")
@@ -1370,9 +1328,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # -------------------------------------------------------------------------
-    # Phase 4 — Cross-layer analysis (only when >1 layer trained)
-    # -------------------------------------------------------------------------
+    # phase 4: cross-layer analysis (only when more than one layer was trained)
     if len(layers) > 1:
         layer_dirs = {layer: _layer_dir(layer) for layer in layers}
         cross_layer_analysis(layer_dirs)

@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
 """
-Medical Dataset Formatting
-==========================
-All data loading, cleaning, and streaming for the SAE training pipeline.
+medical dataset formatting for the SAE training pipeline.
 
-Instruction-formatted data is critical for instruct-tuned models: activations
-at inference time look like chat templates, not raw prose. Training on plain
-corpus text produces coarse, poorly-steerable features.
+instruction-formatted data is important here: the model sees chat templates
+at inference time, not raw text. training on plain prose gives worse features.
 (FAST paper, arXiv:2506.07691; "SAEs are Highly Dataset Dependent", LessWrong 2024)
 
-Sources (~1/3 each, ~150k total):
-  1. Medical MCQ  — medmcqa (primary), bigbio/med_qa (fallback), MedQA-USMLE (2nd fallback)
-  2. PubMed QA    — biomedical Q&A with long-form answers
-  3. PubMed Abs   — abstracts wrapped as summarisation instructions
+sources (~1/3 each, ~150k total):
+  1. medical MCQ  -- medmcqa (primary), bigbio/med_qa (fallback), MedQA-USMLE (2nd fallback)
+  2. pubMed QA    -- biomedical Q&A with long-form answers
+  3. pubMed abs   -- abstracts wrapped as summarisation instructions
 """
 
 from datasets import load_dataset
 from typing import Iterator, Tuple
 
 
-# =============================================================================
-# Llama 3.2 Instruct Chat Template
-# =============================================================================
+# llama 3.2 instruct chat template tokens
 
 _LLAMA_USER = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
 _LLAMA_ASST = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
@@ -29,23 +24,20 @@ _LLAMA_END  = "<|eot_id|>"
 
 
 def _chat(question: str, answer: str) -> str:
-    """Wrap Q/A pair in Llama 3.2 Instruct chat template."""
+    """wraps a Q/A pair in the llama 3.2 instruct chat format."""
     return f"{_LLAMA_USER}{question.strip()}{_LLAMA_ASST}{answer.strip()}{_LLAMA_END}"
 
 
-# =============================================================================
-# Source 1: Medical MCQ  (medmcqa → bigbio/med_qa → MedQA-USMLE fallback chain)
-# =============================================================================
+# source 1: medical MCQ (medmcqa -> bigbio/med_qa -> MedQA-USMLE fallback chain)
 
 def _stream_medmcqa(max_count: int, max_tokens: int) -> Iterator[Tuple[str, str]]:
     """
-    Load MedMCQA (Indian medical MCQ).
-    Falls back to bigbio/med_qa (USMLE-style) then MedQA-USMLE if unavailable.
+    loads medical MCQ data, trying three sources in order until one works.
     """
     count = 0
     source_name = "medmcqa"
 
-    # ── Primary: medmcqa ────────────────────────────────────────────────────
+    # try the main source first
     try:
         ds = load_dataset("medmcqa", split="train", streaming=True)
         _opt_keys = ["opa", "opb", "opc", "opd"]
@@ -59,6 +51,7 @@ def _stream_medmcqa(max_count: int, max_tokens: int) -> Iterator[Tuple[str, str]
                 continue
             opts_str     = "\n".join(f"{chr(65+i)}. {o}" for i, o in enumerate(options) if o)
             question_text = f"{q}\n{opts_str}"
+            # use the explanation if it's long enough, otherwise just state the answer
             answer_text   = exp if len(exp) > 20 else f"The correct answer is {chr(65+cop)}: {correct}."
             yield _chat(question_text, answer_text), f"{source_name}:{count}"
             count += 1
@@ -69,7 +62,7 @@ def _stream_medmcqa(max_count: int, max_tokens: int) -> Iterator[Tuple[str, str]
     except Exception as e:
         print(f"  medmcqa unavailable ({e}), trying bigbio/med_qa...")
 
-    # ── Fallback 1: bigbio/med_qa (USMLE 4-option) ──────────────────────────
+    # first fallback: usmle-style questions
     source_name = "med_qa"
     try:
         ds = load_dataset(
@@ -96,7 +89,7 @@ def _stream_medmcqa(max_count: int, max_tokens: int) -> Iterator[Tuple[str, str]
     except Exception as e:
         print(f"  bigbio/med_qa unavailable ({e}), trying MedQA-USMLE...")
 
-    # ── Fallback 2: GBaker/MedQA-USMLE-4-options ────────────────────────────
+    # second fallback
     source_name = "medqa_usmle"
     try:
         ds = load_dataset("GBaker/MedQA-USMLE-4-options", split="train", streaming=True)
@@ -123,12 +116,10 @@ def _stream_medmcqa(max_count: int, max_tokens: int) -> Iterator[Tuple[str, str]
         print(f"  MCQ: {count} samples loaded from fallback sources")
 
 
-# =============================================================================
-# Source 2: PubMed QA
-# =============================================================================
+# source 2: pubmed QA
 
 def _stream_pubmed_qa(count_offset: int, max_count: int, max_tokens: int) -> Iterator[Tuple[str, str]]:
-    """PubMed QA: biomedical questions with long-form answers."""
+    """pubmed QA: biomedical questions with long-form answers."""
     count = count_offset
     try:
         ds = load_dataset(
@@ -139,6 +130,7 @@ def _stream_pubmed_qa(count_offset: int, max_count: int, max_tokens: int) -> Ite
             q      = (item.get("question") or "").strip()
             answer = (item.get("long_answer") or "").strip()
             if not q or not answer:
+                # fall back to context passages if there's no long answer
                 ctx_list = (
                     item.get("context", {}).get("contexts", [])
                     if isinstance(item.get("context"), dict)
@@ -154,12 +146,10 @@ def _stream_pubmed_qa(count_offset: int, max_count: int, max_tokens: int) -> Ite
         print(f"  PubMedQA unavailable: {e}")
 
 
-# =============================================================================
-# Source 3: PubMed Abstracts as Summarisation Instructions
-# =============================================================================
+# source 3: pubmed abstracts as summarisation instructions
 
 def _stream_pubmed_abs(count_offset: int, num_samples: int, max_tokens: int) -> Iterator[Tuple[str, str]]:
-    """PubMed abstracts wrapped as summarisation/explanation tasks."""
+    """pubmed abstracts wrapped as summarisation tasks."""
     count = count_offset
     try:
         ds = load_dataset(
@@ -169,7 +159,7 @@ def _stream_pubmed_abs(count_offset: int, num_samples: int, max_tokens: int) -> 
             abstract = (item.get("abstract") or "").strip()
             if not abstract:
                 continue
-            # First half = context presented to the model; second half = answer
+            # split the abstract in half: first half is the prompt, second is the answer
             mid           = len(abstract) // 2
             question_text = (
                 "Summarise and explain the clinical significance of this medical finding:\n\n"
@@ -185,35 +175,33 @@ def _stream_pubmed_abs(count_offset: int, num_samples: int, max_tokens: int) -> 
         print(f"  PubMed abstracts unavailable: {e}")
 
 
-# =============================================================================
-# Public API — used by main.py
-# =============================================================================
+# public api used by main.py
 
 def stream_medical_texts(num_samples: int, max_tokens: int) -> Iterator[Tuple[str, str]]:
     """
-    Stream (text, source_id) tuples formatted as Llama 3.2 Instruct chat conversations.
+    streams (text, source_id) tuples formatted as llama 3.2 instruct chat conversations.
 
-    Yields approximately num_samples / 3 samples from each of three medical sources.
-    Prints a warning if any source fails to load.
+    yields roughly num_samples / 3 from each of the three medical sources.
+    prints a warning if any source fails to load.
 
     Args:
-        num_samples: Total number of samples to stream.
-        max_tokens:  Token budget per sample (used to cap answer length).
+        num_samples: total number of samples to stream.
+        max_tokens:  token budget per sample (used to cap answer length).
 
     Yields:
-        (text, source_id) where text is a formatted chat string and source_id
-        identifies the origin (e.g. "medmcqa:1234", "pubmed_qa:5678").
+        (text, source_id) where source_id identifies the origin
+        e.g. "medmcqa:1234", "pubmed_qa:5678"
     """
     third = num_samples // 3
 
-    # Source 1: Medical MCQ
+    # source 1: medical MCQ
     src1_count = 0
     for text, source_id in _stream_medmcqa(third, max_tokens):
         yield text, source_id
         src1_count += 1
     print(f"  [dataset] Source 1 (MCQ): {src1_count} / {third} samples")
 
-    # Source 2: PubMed QA
+    # source 2: pubmed QA
     src2_count = 0
     src2_start = src1_count
     for text, source_id in _stream_pubmed_qa(src2_start, src2_start + third, max_tokens):
@@ -221,7 +209,7 @@ def stream_medical_texts(num_samples: int, max_tokens: int) -> Iterator[Tuple[st
         src2_count += 1
     print(f"  [dataset] Source 2 (PubMed QA): {src2_count} / {third} samples")
 
-    # Source 3: PubMed abstracts — fill remainder up to num_samples
+    # source 3: pubmed abstracts fill the rest up to num_samples
     src3_count = 0
     src3_start = src1_count + src2_count
     for text, source_id in _stream_pubmed_abs(src3_start, num_samples, max_tokens):

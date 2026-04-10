@@ -7,7 +7,7 @@ A mechanistic interpretability tool for **Llama 3.2 1B-Instruct**. Trains a **Ba
 ## Pipeline Overview
 
 <p align="center">
-  <img src="visualizations/figures/architecture.png" alt="Pipeline architecture" width="860"/>
+  <img src="visualizations/figures/architecture.png" alt="Pipeline architecture" width="860" style="background:white;padding:8px;border-radius:6px;"/>
 </p>
 
 **Three stages:**
@@ -154,7 +154,7 @@ Shannon entropy of each feature's MaxAct token distribution — lower entropy = 
 Features are largely layer-specific. Only ~11% of L4 features have a close match in L12 (cosine sim > 0.7), while L4↔L8 and L8↔L12 share more (~11–32%), consistent with incremental representational refinement.
 
 <p align="center">
-  <img src="visualizations/figures/cross_layer.png" alt="Cross-layer feature overlap" width="500"/>
+  <img src="visualizations/figures/cross_layer.png" alt="Cross-layer feature overlap" width="500" style="background:white;padding:8px;border-radius:6px;"/>
 </p>
 
 <p align="center">
@@ -279,7 +279,3 @@ High-confidence features with strong activations that produce clear output shift
 > *"What should a physician consider when a patient reports fatigue?"*
 
 Run with feature 1071 at **+30** and feature 5028 at **+20** for a dramatic shift toward respiratory/metabolic framing.
-
----
-
-*Development of this project was aided by Claude (Anthropic).*

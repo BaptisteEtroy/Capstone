@@ -1,7 +1,6 @@
 """
-Configuration & Shared Components
-==================================
-Central configuration and reusable classes for the SAE interpretability pipeline.
+configuration and shared components for the SAE interpretability pipeline.
+all hyperparameters live here — change things here, not in other files.
 """
 
 import torch
@@ -12,45 +11,39 @@ from pathlib import Path
 from typing import List, Dict
 
 
-# =============================================================================
-# Configuration Constants
-# =============================================================================
+# configuration constants
 
-# Model: Llama 3.2 1B (instruction-tuned)
+# llama 3.2 1b instruct-tuned
 MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 D_MODEL = 2048
 
-# Layer: Middle layer for semantic features
+# layer 12 sits in the middle of the network and has rich semantic features
 TARGET_LAYER = 12
 HOOK_TYPE = "resid_post"
 
-# SAE: BatchTopK architecture (Bussmann et al. 2024) — batch-level sparsity allocation.
-# Expansion 4x gives 8192 features — proven stable at this token budget (~15M tokens).
-# 8x (16384) requires ~50M+ tokens to avoid 80%+ dead features; reverted.
-# TOP_K 64: avg features active per token (canonical 4x value; 96 was for 8x).
-# AUX_COEFF 1/32 per OpenAI scaling paper.
-# AUX_K 256: larger with 4x dict — more gradient signal to dead features (was 128 at 8x).
+# batchTopK SAE (Bussmann et al. 2024), batch-level sparsity allocation.
+# 4x expansion = 8192 features, stable at ~15M tokens.
+# tried 8x (16384) but needed 50M+ tokens to avoid 80%+ dead features, so reverted.
+# k=64 is the canonical value for 4x; aux_k=256 gives more gradient to dead features.
 EXPANSION_FACTOR = 4    # d_hidden = 2048 * 4 = 8192 features
 TOP_K = 64              # avg features active per token
 AUX_COEFF = 1 / 32     # auxiliary loss coefficient (Gao et al. 2024)
 AUX_K = 256            # features used in auxiliary loss (scaled up from 128 at 8x)
 
-# Training
+# training
 LEARNING_RATE = 1e-4
 NUM_EPOCHS = 8
 BATCH_SIZE = 4096
-NUM_SAMPLES = 500_000   
+NUM_SAMPLES = 500_000
 
-# Output
+# output
 MEDICAL_OUTPUT_DIR = Path("medical_outputs")
 
 
-# =============================================================================
-# Utility Functions
-# =============================================================================
+# utility functions
 
 def get_device() -> str:
-    """Detect best available device."""
+    """picks the best available device: cuda > mps > cpu."""
     if torch.cuda.is_available():
         return "cuda"
     elif torch.backends.mps.is_available():
@@ -58,13 +51,11 @@ def get_device() -> str:
     return "cpu"
 
 
-# =============================================================================
-# Data Classes
-# =============================================================================
+# data classes
 
 @dataclass
 class SAEOutput:
-    """Output from SAE forward pass."""
+    """bundles everything the SAE forward pass returns."""
     reconstructed: torch.Tensor
     hidden: torch.Tensor
     loss: torch.Tensor
@@ -75,7 +66,7 @@ class SAEOutput:
 
 @dataclass
 class MaxActExample:
-    """A single example of a token that strongly activates a feature."""
+    """one token example that strongly activates a given feature."""
     token: str
     token_id: int
     activation: float
@@ -87,11 +78,10 @@ class MaxActExample:
 @dataclass
 class FeatureInfo:
     """
-    Information about a learned feature using both interpretability methods.
+    holds everything we know about a learned feature after analysis.
 
-    Input-centric (MaxAct): What inputs trigger this feature?
-    Output-centric (VocabProj): What outputs does this feature promote?
-    Positional: Does this feature fire at specific positions in the sequence?
+    maxact tells us what inputs trigger it, vocabproj tells us what
+    outputs it promotes, and position stats tell us if it's positional.
     """
     index: int
     activation_frequency: float
@@ -102,41 +92,37 @@ class FeatureInfo:
     vocab_projection_logits: List[float]
     position_mean: float = 0.0
     position_std: float = 0.0
-    # Monosemanticity proxy: Shannon entropy of MaxAct token distribution (bits).
-    # Low entropy = feature fires on a tight token cluster = more monosemantic.
+    # shannon entropy of the maxact token distribution (bits).
+    # low entropy means the feature fires on a tight cluster of similar tokens (monosemantic).
     maxact_entropy: float = 0.0
-    # Fraction of MaxAct examples that came from each training dataset.
-    # Keys are source_id strings (e.g. "medmcqa", "pubmed_qa", "pubmed_abs").
+    # fraction of maxact examples from each training dataset
     source_breakdown: Dict[str, float] = field(default_factory=dict)
-    # TokenChange (causal output-centric): inject decoder direction via hook, measure
-    # how next-token distribution shifts. More rigorous than VocabProj at layer 12
-    # because it runs the real forward pass through all downstream transformer layers.
+    # tokenchange: inject the decoder direction and measure how next-token probs shift.
+    # more reliable than vocabproj since it goes through the actual downstream layers.
     token_change_promoted: List[str] = field(default_factory=list)
     token_change_suppressed: List[str] = field(default_factory=list)
-    token_change_kl: float = 0.0       # mean KL(steered || baseline) across contexts
-    token_change_kl_std: float = 0.0   # std of KL across contexts (consistency signal)
-    token_change_n_contexts: int = 0   # how many MaxAct examples were used
+    token_change_kl: float = 0.0       # mean kl(steered || baseline) across contexts
+    token_change_kl_std: float = 0.0   # std of kl across contexts (consistency signal)
+    token_change_n_contexts: int = 0   # how many maxact examples were used
 
 
-# =============================================================================
-# Sparse Autoencoder Model
-# =============================================================================
+# sparse autoencoder model
 
 class SparseAutoencoder(nn.Module):
     """
-    BatchTopK Sparse Autoencoder (Bussmann et al. 2024 + Gao et al. 2024).
+    batchTopK sparse autoencoder (Bussmann et al. 2024 + Gao et al. 2024).
 
-    Improvement over standard TopK: selects the top batch_size*k activations
-    across the ENTIRE BATCH rather than per-sample. This allows variable sparsity
-    per sample (some examples naturally need more features) and provides more
-    gradient signal to each feature, reducing dead features.
+    the key difference from standard topk: instead of selecting k features
+    per sample, we select batch_size*k activations across the whole batch.
+    this lets some samples use more features than others and gives more
+    gradient signal to each feature, which really helps with dead features.
 
-    During inference (eval mode) falls back to per-sample TopK for determinism.
+    falls back to per-sample topk at inference for deterministic outputs.
 
-    Encoder initialisation follows Gao et al. 2024:
-      - encoder.weight initialised as decoder.weight^T  (parallel directions)
-      - b_pre initialised from a sample of training data (geometric median approx)
-      - decoder columns at unit norm throughout training
+    init follows Gao et al. 2024:
+      - encoder.weight = decoder.weight^T (parallel directions)
+      - b_pre = mean of a data sample (approximates geometric median)
+      - decoder columns kept at unit norm throughout training
     """
 
     def __init__(
@@ -160,8 +146,8 @@ class SparseAutoencoder(nn.Module):
         self.decoder = nn.Linear(self.d_hidden, d_model, bias=True)
         self.b_pre = nn.Parameter(torch.zeros(d_model))
 
-        # Decoder^T initialisation: encoder directions parallel to decoder directions.
-        # This is the recommended init from the OpenAI TopK SAE paper.
+        # init encoder as transpose of decoder so their directions are aligned.
+        # this is the recommended init from the openai topk sae paper.
         nn.init.kaiming_uniform_(self.decoder.weight, nonlinearity="linear")
         self._normalize_decoder()
         self.encoder.weight.data = self.decoder.weight.data.T.clone()
@@ -170,36 +156,34 @@ class SparseAutoencoder(nn.Module):
 
     def init_bias_from_data(self, sample: torch.Tensor):
         """
-        Initialise b_pre to the mean of a data sample — an efficient approximation
-        of the geometric median (Gao et al. 2024). Centres the encoder input so that
-        pre-activations start near zero rather than being dominated by the data mean.
+        sets b_pre to the mean of a data sample, which approximates the geometric
+        median (Gao et al. 2024). this centres the encoder input so pre-activations
+        start near zero instead of being dominated by the data mean.
 
-        Call this ONCE before training begins, with a representative batch of
-        model activations.
+        call this once before training with a representative batch of activations.
         """
         with torch.no_grad():
             self.b_pre.data = sample.float().mean(dim=0).to(self.b_pre.device)
-        # Re-sync encoder init after bias is set
+        # re-sync encoder weights after b_pre is set
         self.encoder.weight.data = self.decoder.weight.data.T.clone()
 
     def _normalize_decoder(self):
-        """Keep decoder columns at unit norm for interpretability."""
+        """keeps decoder columns at unit norm, which is important for interpretability."""
         with torch.no_grad():
             norms = self.decoder.weight.norm(dim=0, keepdim=True)
             self.decoder.weight.data = self.decoder.weight.data / (norms + 1e-8)
 
     def _batch_topk(self, pre: torch.Tensor):
         """
-        BatchTopK: select top batch_size*k activations across the whole batch.
+        selects the top batch_size*k activations across the whole batch (not per sample).
 
-        Returns (hidden, fired_mask) where hidden has exactly batch_size*k
-        non-zero values total (not per-sample), and fired_mask is a bool tensor
-        marking which (sample, feature) pairs fired.
+        returns (hidden, fired_mask) where hidden has batch_size*k non-zero values
+        total, and fired_mask marks which (sample, feature) pairs fired.
         """
         B = pre.shape[0]
         flat = pre.reshape(-1)
         total_k = B * self.k
-        # Use kth-largest as threshold (handles ties conservatively)
+        # use kth-largest as threshold, handles ties conservatively
         threshold = flat.topk(total_k).values[-1]
         fired_mask = pre >= threshold
         hidden = (pre * fired_mask.float()).clamp(min=0)
@@ -207,8 +191,8 @@ class SparseAutoencoder(nn.Module):
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Encode: activate features via BatchTopK (training) or per-sample TopK (inference).
-        Inference always uses per-sample TopK for deterministic, consistent outputs.
+        encodes x using batchTopK during training, per-sample topk during inference.
+        inference uses per-sample topk so outputs are deterministic regardless of batch size.
         """
         pre = self.encoder(x - self.b_pre)
         if self.use_batch_topk and self.training and x.dim() == 2 and x.shape[0] > 1:
@@ -225,7 +209,6 @@ class SparseAutoencoder(nn.Module):
     def forward(self, x: torch.Tensor) -> SAEOutput:
         pre = self.encoder(x - self.b_pre)
 
-        # Main activation
         if self.use_batch_topk and self.training and x.shape[0] > 1:
             hidden, fired_mask = self._batch_topk(pre)
         else:
@@ -238,9 +221,9 @@ class SparseAutoencoder(nn.Module):
         reconstruction_loss = F.mse_loss(reconstructed, x)
         l0_sparsity = (hidden > 0).float().sum(dim=-1).mean()
 
-        # Auxiliary loss (Gao et al. 2024): give unfired features gradient by
-        # having them reconstruct the residual error.
-        # Uses aux_k=256 (much larger than main k=64) to give more dead features signal.
+        # auxiliary loss (Gao et al. 2024): unfired features get gradient by trying
+        # to reconstruct the residual error. aux_k=256 is much larger than k=64
+        # so more dead features get signal each step.
         aux_loss = torch.tensor(0.0, device=x.device)
         if self.training and self.aux_coeff > 0:
             pre_aux = pre.detach().clone()

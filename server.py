@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-SAE Interpretability Lab — FastAPI server
-Replaces the Gradio interface with a clean REST API + static HTML/JS/CSS frontend.
+fastapi server for the SAE interpretability lab.
+serves the REST API and the static html/js/css frontend.
 """
 
 import os
@@ -29,11 +29,9 @@ from config import (
     MEDICAL_OUTPUT_DIR, get_device,
 )
 
-# ---------------------------------------------------------------------------
-# CLI: --layer N  (default = TARGET_LAYER = 12)
-# When multi-layer training was used, outputs live in medical_outputs/layer_N/.
-# For single-layer / legacy runs they remain at medical_outputs/ directly.
-# ---------------------------------------------------------------------------
+# --layer N lets you pick which layer's outputs to serve (default = 12)
+# for multi-layer runs, outputs live in medical_outputs/layer_N/
+# for single-layer or legacy runs they're at medical_outputs/ directly
 _parser = argparse.ArgumentParser(add_help=False)
 _parser.add_argument("--layer", type=int, default=TARGET_LAYER,
                      help="Which layer's SAE to serve (default: 12)")
@@ -41,11 +39,11 @@ _known, _ = _parser.parse_known_args()
 _SERVE_LAYER: int = _known.layer
 
 def _resolve_output_dir() -> Path:
-    """Return the directory where the requested layer's artefacts live."""
+    """return the directory where the requested layer's artefacts live."""
     subdir = MEDICAL_OUTPUT_DIR / f"layer_{_SERVE_LAYER}"
     if subdir.exists():
         return subdir
-    # Fallback: legacy single-layer layout at root
+    # fallback: legacy single-layer layout at root
     return MEDICAL_OUTPUT_DIR
 
 _OUTPUT_DIR = _resolve_output_dir()
@@ -59,9 +57,7 @@ _SPECIAL_TOKENS = {
 SRC_DIR = Path(__file__).parent / "src"
 
 
-# =============================================================================
-# State
-# =============================================================================
+# server state
 
 class ServerState:
     def __init__(self):
@@ -112,7 +108,7 @@ class ServerState:
             print(f"Load error: {e}")
 
     def load_features_only(self):
-        """Load just the JSON data (no GPU needed) for browse/search endpoints."""
+        """load just the json data (no gpu needed) for browse/search endpoints."""
         if self.feature_by_index:
             return
         labeled_path = _OUTPUT_DIR / "labeled_features.json"
@@ -124,7 +120,7 @@ class ServerState:
             with open(features_path) as f:
                 all_feats = json.load(f)
             self.feature_by_index = {feat["index"]: feat for feat in all_feats}
-            # Merge labels
+            # merge labels into the feature dict
             label_map = {f["index"]: f for f in self.labeled_features}
             for feat in all_feats:
                 if feat["index"] in label_map:
@@ -137,21 +133,19 @@ class ServerState:
 srv = ServerState()
 
 
-# =============================================================================
-# Lifecycle
-# =============================================================================
+# lifecycle
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     srv.load_features_only()
-    # Defer heavy model loading to first request
+    # defer heavy model loading to the first actual request
     yield
 
 
 app = FastAPI(lifespan=lifespan, title="SAE Lab API")
 
 
-# Disable caching for all static assets so frontend changes are always picked up
+# disable caching for all static assets so frontend changes always show up
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 
@@ -167,13 +161,16 @@ class NoCacheMiddleware(BaseHTTPMiddleware):
 app.add_middleware(NoCacheMiddleware)
 
 
-# =============================================================================
-# Pydantic models
-# =============================================================================
+# pydantic models
 
 class ChatRequest(BaseModel):
     message: str
     history: List[Dict[str, str]] = []
+
+
+class SteerRequest(BaseModel):
+    prompt: str
+    features: Dict[str, float]   # str keys because JSON objects have string keys
 
 
 class SteerRequest(BaseModel):
@@ -186,12 +183,10 @@ class CircuitRequest(BaseModel):
     text: str
 
 
-# =============================================================================
-# Core helpers
-# =============================================================================
+# core helpers
 
 def _get_feature_label(idx: int) -> Tuple[str, str]:
-    """Return (label, confidence) for a feature index."""
+    """return (label, confidence) for a feature index."""
     feat = srv.feature_by_index.get(idx, {})
     label = feat.get("label", f"Feature {idx}")
     conf = feat.get("confidence", "unknown")
@@ -199,7 +194,7 @@ def _get_feature_label(idx: int) -> Tuple[str, str]:
 
 
 def _encode_text(text: str) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
-    """Tokenize text, run model, return (hidden [seq, n_feat], token_ids, token_strs)."""
+    """tokenize text, run model, return (hidden [seq, n_feat], token_ids, token_strs)."""
     hook_point = _HOOK_POINT
     tokens = srv.model.to_tokens(text)
     token_strs = [srv.model.tokenizer.decode([t]) for t in tokens[0]]
@@ -217,7 +212,7 @@ def _top_features_full(
     threshold: float = 0.3,
     include_source: bool = False,
 ) -> List[Dict]:
-    """Like _top_features but also returns token_indices (top positions in the sequence),
+    """like _top_features but also returns token_indices (top positions in the sequence),
     and optionally source_breakdown + max_act_examples for output attribution."""
     max_per_feat = hidden.max(dim=0).values.cpu()
     pool_size = min(top_k * 5, max_per_feat.shape[0])
@@ -298,9 +293,7 @@ def _build_prompt(message: str, history: List[Dict[str, str]]) -> str:
     return srv.model.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
-# =============================================================================
 # API endpoints
-# =============================================================================
 
 @app.get("/health")
 async def health():
@@ -315,8 +308,8 @@ async def health():
 
 @app.post("/api/chat/stream")
 async def chat_stream(req: ChatRequest):
-    # NOTE: do NOT call srv.load() here — it blocks the event loop.
-    # Loading happens inside the executor thread so SSE events can flow immediately.
+    # don't call srv.load() here - it blocks the event loop
+    # loading happens in the executor thread so SSE events can flow right away
 
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
@@ -326,7 +319,7 @@ async def chat_stream(req: ChatRequest):
 
     def run():
         try:
-            # ── 1. Load model (only blocks on first ever request) ────────────
+            # 1. load model (only blocks on first ever request)
             if not srv.loaded:
                 _put({"type": "log", "text": "Loading model…"})
                 srv.load()
@@ -334,20 +327,20 @@ async def chat_stream(req: ChatRequest):
                     _put({"type": "error", "text": srv.error or "Failed to load model"})
                     return
 
-            # ── 2. Input attribution ─────────────────────────────────────────
+            # 2. input attribution
             _put({"type": "log", "text": "Tokenizing input"})
             prompt = _build_prompt(req.message, req.history)
 
             _put({"type": "log", "text": "Input attribution · SAE encode"})
             input_hidden_full, input_raw_tokens, _ = _encode_text(req.message)
-            # Skip BOS at position 0 so token_indices align with input_token_strs
+            # skip BOS at position 0 so token_indices align with input_token_strs
             input_token_strs = [
                 srv.model.tokenizer.decode([t])
                 for t in input_raw_tokens[0].tolist()[1:]
             ]
             input_features = _top_features_full(input_hidden_full[1:], top_k=8)
 
-            # ── 3. Generate (uses KV cache — fast) ───────────────────────────
+            # 3. generate (uses kv cache)
             _put({"type": "log", "text": "Generating response"})
             tokens = srv.model.to_tokens(prompt)
             with torch.no_grad():
@@ -368,7 +361,7 @@ async def chat_stream(req: ChatRequest):
 
             response = srv.model.tokenizer.decode(response_ids.tolist())
 
-            # ── 4. Output attribution ────────────────────────────────────────
+            # 4. output attribution
             hook_point = _HOOK_POINT
             prompt_len = tokens.shape[1]
             with torch.no_grad():
@@ -467,9 +460,8 @@ def _do_steer(prompt: str, feature_strengths: Dict[int, float], max_tokens: int)
 
     steer_unit = steer_direction / (steer_direction.norm() + 1e-8)
     total_strength = steering_vector.abs().max().item()
-    # Scale: strength 10 → ~10% of resid_norm, capped at 25% to prevent gibberish.
-    # Previously used `total_strength * resid_norm * 0.05` which double-applied strength
-    # (decoder cols are unit-norm so steer_direction.norm() ≈ total_strength already).
+    # strength 10 = ~10% of resid_norm, capped at 25% to avoid gibberish
+    # decoder cols are unit-norm so steer_direction.norm() ~ total_strength already
     scale_frac = min(total_strength * 0.01, 0.25)
     scaled_steer = steer_unit * resid_norm * scale_frac
 
@@ -651,9 +643,7 @@ async def get_feature(idx: int):
     }
 
 
-# =============================================================================
-# Static files + SPA routing
-# =============================================================================
+# static files and SPA routing
 
 app.mount("/styles", StaticFiles(directory=str(SRC_DIR / "styles")), name="styles")
 app.mount("/scripts", StaticFiles(directory=str(SRC_DIR / "scripts")), name="scripts")
@@ -679,9 +669,7 @@ async def spa_fallback(path: str):
     return FileResponse(str(SRC_DIR / "index.html"))
 
 
-# =============================================================================
-# Entry point
-# =============================================================================
+# entry point
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
