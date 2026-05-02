@@ -1,9 +1,12 @@
 /venv
 /outputs
 /medical_outputs
+/code_outputs
 /__pycache__
 
 .env
 .env.local
 .claude
 .DS_Store
+
+CLAUDE.md

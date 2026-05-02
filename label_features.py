@@ -12,11 +12,9 @@ features are labeled using two complementary methods:
 gpt-4o-mini labels take priority if both methods produce a label for the same feature.
 
 Usage:
-    python label_features.py              # Heuristic + LLM (default)
-    python label_features.py --dry-run    # Preview without API calls
-    python label_features.py --heuristic-only   # Skip LLM entirely (free)
-    python label_features.py --no-heuristic     # LLM only
-    python label_features.py --min-freq 0.0005 --max-freq 0.30  # Custom thresholds
+    python label_features.py                    # code domain (default), layer 12
+    python label_features.py --domain medical   # medical domain
+    python label_features.py --layer 8          # specific layer
 """
 
 import json
@@ -34,7 +32,7 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 load_dotenv()
 
-from config import MEDICAL_OUTPUT_DIR, TARGET_LAYER
+from config import MEDICAL_OUTPUT_DIR, CODE_OUTPUT_DIR, TARGET_LAYER
 
 MAX_TOKENS_PER_SEQ = 128  # must match max_tokens in collect_activations
 
@@ -585,48 +583,36 @@ def parse_batch_response(response: str, features_batch: List[Dict]) -> List[tupl
 
 def label_features(
     features: List[Dict],
-    model: str = "gpt-4o-mini",
-    dry_run: bool = False,
-    max_features: int = 3500,
-    batch_size: int = LLM_BATCH_SIZE,
-    min_freq: float = 0.0001,
-    max_freq: float = 0.30,
     no_filter: bool = False,
-    heuristic_only: bool = False,
-    no_heuristic: bool = False,
 ) -> List[LabeledFeature]:
     """
     label features using heuristics first, then gpt-4o-mini for the rest.
 
     heuristics cover: punctuation, digits, special tokens, positional.
-    they run on all features with no frequency filter and are always included
-    in the output json (previously they were being lost due to a save bug - fixed).
-
     gpt-4o-mini runs on quality-filtered semantic candidates not already claimed.
     gpt-4o-mini labels win if both methods produce a result for the same feature.
     """
+    model       = "gpt-4o-mini"
+    max_features = 3500
+    batch_size  = LLM_BATCH_SIZE
+    min_freq    = 0.0001
+    max_freq    = 0.30
+
     print(f"\nTotal features available: {len(features)}")
 
     # step 1: heuristic labeling, all features, no filter
     heuristic_labeled: Dict[int, LabeledFeature] = {}
 
-    if not no_heuristic:
-        print("\nStep 1: Heuristic labeling (all features, no API)...")
-        for f in tqdm(features, desc="  Heuristic"):
-            result = heuristic_label_feature(f)
-            if result:
-                heuristic_labeled[f["index"]] = result
+    print("\nStep 1: Heuristic labeling (all features, no API)...")
+    for f in tqdm(features, desc="  Heuristic"):
+        result = heuristic_label_feature(f)
+        if result:
+            heuristic_labeled[f["index"]] = result
 
-        by_source: Dict[str, int] = Counter(lf.label_source for lf in heuristic_labeled.values())
-        print(f"  Heuristic labels: {len(heuristic_labeled)} features")
-        for src, cnt in sorted(by_source.items()):
-            print(f"    {src}: {cnt}")
-
-    if heuristic_only or dry_run:
-        if dry_run:
-            print("\n[DRY RUN] Would also run gpt-4o-mini on quality-filtered features.")
-            _preview_features(features, min_freq, max_freq, no_filter)
-        return list(heuristic_labeled.values())
+    by_source: Dict[str, int] = Counter(lf.label_source for lf in heuristic_labeled.values())
+    print(f"  Heuristic labels: {len(heuristic_labeled)} features")
+    for src, cnt in sorted(by_source.items()):
+        print(f"    {src}: {cnt}")
 
     # step 2: LLM semantic labeling, quality-filtered, skip heuristic hits
     if not os.environ.get("OPENAI_API_KEY"):
@@ -704,20 +690,6 @@ def label_features(
     return final
 
 
-def _preview_features(features, min_freq, max_freq, no_filter):
-    if no_filter:
-        candidates = features
-    else:
-        candidates = filter_high_quality_features(features, min_freq=min_freq, max_freq=max_freq)
-    candidates.sort(key=compute_quality_score, reverse=True)
-    print(f"\n  Top 10 semantic candidates (would be sent to gpt-4o-mini):")
-    for f in candidates[:10]:
-        max_act, _ = extract_feature_tokens(f)
-        score = compute_quality_score(f)
-        print(f"  Feature {f['index']:4d} (q={score:.3f}, freq={f['frequency']*100:.2f}%): "
-              f"{[t for t, _, _ in max_act[:3]]}")
-
-
 # save and print
 
 def save_labeled_features(labeled_features: List[LabeledFeature], output_path: Path):
@@ -785,36 +757,18 @@ def print_labeled_features(labeled_features: List[LabeledFeature]):
 
 def main():
     parser = argparse.ArgumentParser(description="Label SAE features using OpenAI + heuristics")
-    parser.add_argument("--model", type=str, default="gpt-4o-mini",
-                        help="OpenAI model ID (default: gpt-4o-mini)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Preview without API calls (runs heuristics, previews gpt-4o-mini candidates)")
-    parser.add_argument("--heuristic-only", action="store_true",
-                        help="Heuristic labeling only — no gpt-4o-mini API calls")
-    parser.add_argument("--no-heuristic", action="store_true",
-                        help="Skip heuristic labeling, use gpt-4o-mini only")
-    parser.add_argument("--max-features", type=int, default=3500,
-                        help="Max semantic features to send to gpt-4o-mini (default: 3500)")
-    parser.add_argument("--batch-size", type=int, default=LLM_BATCH_SIZE,
-                        help=f"Features per gpt-4o-mini API call (default: {LLM_BATCH_SIZE})")
+    parser.add_argument("--domain", type=str, default="code", choices=["code", "medical"],
+                        help="Which domain's outputs to label (default: code)")
     parser.add_argument("--layer", type=int, default=TARGET_LAYER,
-                        help=(
-                            "Which layer's features to label (default: 12). "
-                            "Resolves to medical_outputs/layer_N/ for multi-layer runs, "
-                            "or medical_outputs/ for the legacy single-layer layout."
-                        ))
+                        help="Which layer's features to label (default: 12)")
     parser.add_argument("--output", type=str, default=None)
-    parser.add_argument("--min-freq", type=float, default=0.0005,
-                        help="Min activation frequency (default: 0.05%)")
-    parser.add_argument("--max-freq", type=float, default=0.30,
-                        help="Max activation frequency (default: 30%)")
     parser.add_argument("--no-filter", action="store_true",
                         help="Disable quality filter for gpt-4o-mini candidates")
     args = parser.parse_args()
 
-    # resolve per-layer directory (same logic as main.py and server.py)
-    layer_subdir = MEDICAL_OUTPUT_DIR / f"layer_{args.layer}"
-    output_dir = layer_subdir if layer_subdir.exists() else MEDICAL_OUTPUT_DIR
+    base_dir = CODE_OUTPUT_DIR if args.domain == "code" else MEDICAL_OUTPUT_DIR
+    layer_subdir = base_dir / f"layer_{args.layer}"
+    output_dir = layer_subdir if layer_subdir.exists() else base_dir
     features_path = output_dir / "features.json"
 
     if not features_path.exists():
@@ -824,23 +778,9 @@ def main():
     with open(features_path) as f:
         features = json.load(f)
 
-    print(f"Loaded {len(features)} features from {features_path} (layer {args.layer})")
+    print(f"Loaded {len(features)} features from {features_path} (domain: {args.domain}, layer {args.layer})")
 
-    labeled_features = label_features(
-        features,
-        model=args.model,
-        dry_run=args.dry_run,
-        max_features=args.max_features,
-        batch_size=args.batch_size,
-        min_freq=args.min_freq,
-        max_freq=args.max_freq,
-        no_filter=args.no_filter,
-        heuristic_only=args.heuristic_only,
-        no_heuristic=args.no_heuristic,
-    )
-
-    if args.dry_run:
-        return
+    labeled_features = label_features(features, no_filter=args.no_filter)
 
     print_labeled_features(labeled_features)
 

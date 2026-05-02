@@ -38,6 +38,7 @@ NUM_SAMPLES = 500_000
 
 # output
 MEDICAL_OUTPUT_DIR = Path("medical_outputs")
+CODE_OUTPUT_DIR    = Path("code_outputs")
 
 
 # utility functions

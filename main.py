@@ -33,11 +33,11 @@ from transformer_lens import HookedTransformer
 from config import (
     MODEL_NAME, D_MODEL, TARGET_LAYER, HOOK_TYPE,
     LEARNING_RATE, NUM_EPOCHS, BATCH_SIZE, NUM_SAMPLES,
-    MEDICAL_OUTPUT_DIR,
+    MEDICAL_OUTPUT_DIR, CODE_OUTPUT_DIR,
     get_device,
     SparseAutoencoder, MaxActExample, FeatureInfo,
 )
-from dataset import stream_medical_texts
+from dataset import stream_medical_texts, stream_code_texts
 
 
 # model loading and activation collection
@@ -68,11 +68,12 @@ def collect_activations(
     batch_size: int = 32,
     max_tokens: int = 128,
     chunk_size: int = 10_000,
-    output_dir: Path = MEDICAL_OUTPUT_DIR,
+    output_dir: Path = CODE_OUTPUT_DIR,
     layer: int = TARGET_LAYER,
+    domain: str = "code",
 ) -> tuple:
     """
-    collect residual stream activations from the given layer using medical datasets.
+    collect residual stream activations from the given layer.
 
     saves activation chunks to disk to stay within ram limits.
     token IDs and source IDs are kept in memory (small) for maxact context building.
@@ -89,7 +90,9 @@ def collect_activations(
     chunks_dir = output_dir / "chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nCollecting activations from {hook_point} (layer {layer})...")
-    print(f"  Dataset: medmcqa + pubmed_qa + pubmed_abs (instruction-formatted) | Samples: {num_samples}")
+    stream_fn = stream_code_texts if domain == "code" else stream_medical_texts
+    dataset_desc = "code_search_net + mbpp + the-stack" if domain == "code" else "medmcqa + pubmed_qa + pubmed_abs"
+    print(f"  Dataset: {dataset_desc} (instruction-formatted) | Samples: {num_samples}")
 
     all_activations = []
     all_token_ids = []
@@ -105,7 +108,7 @@ def collect_activations(
 
     pbar = tqdm(total=num_samples, desc="Collecting")
 
-    for text, source_id in stream_medical_texts(num_samples, max_tokens):
+    for text, source_id in stream_fn(num_samples, max_tokens):
         batch_texts.append(text)
         batch_sources.append(source_id)
         count += 1
@@ -1097,7 +1100,7 @@ def cross_layer_analysis(layer_dirs: Dict[int, Path]):
               f"{shared_count_a2b}/{W_a.shape[0]} "
               f"({results['pairs'][pair_key]['a_to_b']['shared_features_pct']:.1f}%)")
 
-    out_path = MEDICAL_OUTPUT_DIR / "cross_layer_analysis.json"
+    out_path = next(iter(layer_dirs.values())).parent / "cross_layer_analysis.json"
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\n  Cross-layer analysis saved → {out_path}")
@@ -1106,7 +1109,7 @@ def cross_layer_analysis(layer_dirs: Dict[int, Path]):
 # main pipeline
 
 def main():
-    parser = argparse.ArgumentParser(description="Medical SAE pipeline for Llama 3.2 1B")
+    parser = argparse.ArgumentParser(description="SAE pipeline for Llama 3.2 1B")
     parser.add_argument("--quick", action="store_true", help="Quick test (500 samples, 1 epoch)")
     parser.add_argument("--skip-collection", action="store_true", help="Reuse cached activations")
     parser.add_argument("--device", type=str, default=None, help="Device override (auto-detected)")
@@ -1123,14 +1126,17 @@ def main():
         help=(
             "One or more residual-stream layers to train SAEs on "
             "(default: [12]).  E.g. --layers 4 8 12.  "
-            "When more than one layer is given, cross_layer_analysis() is run "
-            "afterwards and the decoder cosine-similarity results are written to "
-            "medical_outputs/cross_layer_analysis.json."
+            "When more than one layer is given, cross_layer_analysis() is run afterwards."
         ),
+    )
+    parser.add_argument(
+        "--domain", type=str, default="code", choices=["code", "medical"],
+        help="Training data domain: 'code' (default) or 'medical'.",
     )
     args = parser.parse_args()
 
     device = args.device or get_device()
+    val_base = CODE_OUTPUT_DIR if args.domain == "code" else MEDICAL_OUTPUT_DIR
 
     # --validate-token-change: sanity check on 10 coherent features
     if args.validate_token_change:
@@ -1139,8 +1145,8 @@ def main():
 
         def _val_dir(l: int) -> Path:
             if len(layers_val) == 1 and l == TARGET_LAYER:
-                return MEDICAL_OUTPUT_DIR
-            return MEDICAL_OUTPUT_DIR / f"layer_{l}"
+                return val_base
+            return val_base / f"layer_{l}"
 
         out_dir = _val_dir(layer_val)
         feat_path = out_dir / "features.json"
@@ -1215,21 +1221,23 @@ def main():
     num_samples = 500 if args.quick else NUM_SAMPLES
     num_epochs = 1 if args.quick else NUM_EPOCHS
     layers: List[int] = args.layers
+    domain: str = args.domain
 
-    # single-layer default (layer 12) goes to medical_outputs/ for backward compat
-    # any other config goes to medical_outputs/layer_N/
+    base_dir = CODE_OUTPUT_DIR if domain == "code" else MEDICAL_OUTPUT_DIR
+
     def _layer_dir(layer: int) -> Path:
         if len(layers) == 1 and layer == TARGET_LAYER:
-            return MEDICAL_OUTPUT_DIR
-        return MEDICAL_OUTPUT_DIR / f"layer_{layer}"
+            return base_dir
+        return base_dir / f"layer_{layer}"
 
-    MEDICAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    base_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "="*60)
-    print("  Medical SAE Pipeline")
+    print(f"  SAE Pipeline — domain: {domain}")
     layers_str = str(layers[0]) if len(layers) == 1 else str(layers)
     print(f"  Model: {MODEL_NAME} | Layers: {layers_str} | Hook: {HOOK_TYPE}")
-    print(f"  Dataset: medmcqa + pubmed_qa + pubmed_abs (chat-formatted)")
+    dataset_desc = "code_search_net + mbpp + the-stack" if domain == "code" else "medmcqa + pubmed_qa + pubmed_abs"
+    print(f"  Dataset: {dataset_desc} (chat-formatted)")
     print("="*60)
     if args.quick:
         print("  [QUICK TEST MODE]")
@@ -1264,7 +1272,7 @@ def main():
         else:
             print(f"\n  [Layer {layer}] Collecting from layer {layer}…")
             token_ids, chunk_files, source_ids, source_list = collect_activations(
-                model, num_samples=num_samples, output_dir=layer_dir, layer=layer,
+                model, num_samples=num_samples, output_dir=layer_dir, layer=layer, domain=domain,
             )
 
         layer_data[layer] = (token_ids, chunk_files, source_ids, source_list)

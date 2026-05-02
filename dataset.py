@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-medical dataset formatting for the SAE training pipeline.
+dataset formatting for the SAE training pipeline.
 
 instruction-formatted data is important here: the model sees chat templates
 at inference time, not raw text. training on plain prose gives worse features.
 (FAST paper, arXiv:2506.07691; "SAEs are Highly Dataset Dependent", LessWrong 2024)
 
-sources (~1/3 each, ~150k total):
+medical sources (~1/3 each, ~150k total):
   1. medical MCQ  -- medmcqa (primary), bigbio/med_qa (fallback), MedQA-USMLE (2nd fallback)
   2. pubMed QA    -- biomedical Q&A with long-form answers
   3. pubMed abs   -- abstracts wrapped as summarisation instructions
+
+code sources (~1/3 each, ~150k total):
+  1. code_search_net Python  -- docstring as question, function body as answer
+  2. mbpp                    -- problem description as question, solution as answer
+  3. codeparrot/github-code  -- Python files wrapped as "explain this code" instructions
 """
 
 from datasets import load_dataset
@@ -216,6 +221,121 @@ def stream_medical_texts(num_samples: int, max_tokens: int) -> Iterator[Tuple[st
         yield text, source_id
         src3_count += 1
     print(f"  [dataset] Source 3 (PubMed Abs): {src3_count} samples")
+
+    total = src1_count + src2_count + src3_count
+    print(f"  [dataset] Total collected: {total} / {num_samples} samples")
+    if total < num_samples * 0.8:
+        print(
+            f"  WARNING: Only {total}/{num_samples} samples collected "
+            f"({100*total/num_samples:.0f}%). Some sources may be unavailable."
+        )
+
+
+# ── code domain ────────────────────────────────────────────────────────────────
+
+def _stream_code_search_net(max_count: int, max_tokens: int) -> Iterator[Tuple[str, str]]:
+    """code_search_net Python: docstring (question) → function body (answer)."""
+    count = 0
+    try:
+        ds = load_dataset(
+            "code_search_net", "python", split="train", streaming=True, trust_remote_code=True,
+        )
+        for item in ds:
+            docstring = (item.get("func_documentation_string") or "").strip()
+            code      = (item.get("func_code_string") or "").strip()
+            if not docstring or not code:
+                continue
+            question = f"Write a Python function that does the following:\n\n{docstring}"
+            answer   = f"```python\n{code[:max_tokens * 4]}\n```"
+            yield _chat(question, answer), f"code_search_net:{count}"
+            count += 1
+            if count >= max_count:
+                return
+        print(f"  [dataset] code_search_net: {count} samples")
+    except Exception as e:
+        print(f"  code_search_net unavailable ({e})")
+
+
+def _stream_mbpp(count_offset: int, max_count: int, max_tokens: int) -> Iterator[Tuple[str, str]]:
+    """mbpp: natural language problem description → Python solution."""
+    count = count_offset
+    try:
+        ds = load_dataset("mbpp", split="train", streaming=True, trust_remote_code=True)
+        for item in ds:
+            problem = (item.get("text") or "").strip()
+            code    = (item.get("code") or "").strip()
+            if not problem or not code:
+                continue
+            question = f"Write a Python function to solve the following problem:\n\n{problem}"
+            answer   = f"```python\n{code[:max_tokens * 4]}\n```"
+            yield _chat(question, answer), f"mbpp:{count}"
+            count += 1
+            if count >= max_count:
+                return
+        print(f"  [dataset] mbpp: {count - count_offset} samples")
+    except Exception as e:
+        print(f"  mbpp unavailable ({e})")
+
+
+def _stream_github_code(count_offset: int, num_samples: int, max_tokens: int) -> Iterator[Tuple[str, str]]:
+    """codeparrot/github-code Python: real GitHub files wrapped as explain-this-code instructions."""
+    count = count_offset
+    try:
+        ds = load_dataset(
+            "codeparrot/github-code", streaming=True, split="train", trust_remote_code=True,
+        )
+        for item in ds:
+            if item.get("language") != "Python":
+                continue
+            code = (item.get("code") or "").strip()
+            if not code or len(code) < 100:
+                continue
+            snippet  = code[:max_tokens * 4]
+            question = f"Explain what the following Python code does and how it works:\n\n```python\n{snippet}\n```"
+            answer   = "This code defines functions and logic to accomplish the described task. It uses standard Python patterns and idioms."
+            yield _chat(question, answer), f"github_code:{count}"
+            count += 1
+            if count >= num_samples:
+                return
+        print(f"  [dataset] github-code: {count - count_offset} samples")
+    except Exception as e:
+        print(f"  github-code unavailable ({e}), skipping third code source")
+
+
+def stream_code_texts(num_samples: int, max_tokens: int) -> Iterator[Tuple[str, str]]:
+    """
+    streams (text, source_id) tuples of Python code Q&A formatted as llama 3.2
+    instruct chat conversations. yields ~num_samples/3 from each of three sources.
+
+    Args:
+        num_samples: total number of samples to stream.
+        max_tokens:  token budget per sample (used to cap code length).
+
+    Yields:
+        (text, source_id) where source_id identifies the origin
+        e.g. "code_search_net:1234", "mbpp:5678", "the_stack:9012"
+    """
+    third = num_samples // 3
+
+    src1_count = 0
+    for text, source_id in _stream_code_search_net(third, max_tokens):
+        yield text, source_id
+        src1_count += 1
+    print(f"  [dataset] Source 1 (code_search_net): {src1_count} / {third} samples")
+
+    src2_count = 0
+    src2_start = src1_count
+    for text, source_id in _stream_mbpp(src2_start, src2_start + third, max_tokens):
+        yield text, source_id
+        src2_count += 1
+    print(f"  [dataset] Source 2 (mbpp): {src2_count} / {third} samples")
+
+    src3_count = 0
+    src3_start = src1_count + src2_count
+    for text, source_id in _stream_github_code(src3_start, num_samples, max_tokens):
+        yield text, source_id
+        src3_count += 1
+    print(f"  [dataset] Source 3 (github-code): {src3_count} samples")
 
     total = src1_count + src2_count + src3_count
     print(f"  [dataset] Total collected: {total} / {num_samples} samples")

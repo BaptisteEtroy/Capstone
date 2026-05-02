@@ -26,25 +26,26 @@ import argparse
 from config import (
     SparseAutoencoder,
     MODEL_NAME, TARGET_LAYER, HOOK_TYPE,
-    MEDICAL_OUTPUT_DIR, get_device,
+    MEDICAL_OUTPUT_DIR, CODE_OUTPUT_DIR, get_device,
 )
 
-# --layer N lets you pick which layer's outputs to serve (default = 12)
-# for multi-layer runs, outputs live in medical_outputs/layer_N/
-# for single-layer or legacy runs they're at medical_outputs/ directly
+# --layer and --domain select which artefacts to serve
 _parser = argparse.ArgumentParser(add_help=False)
 _parser.add_argument("--layer", type=int, default=TARGET_LAYER,
                      help="Which layer's SAE to serve (default: 12)")
+_parser.add_argument("--domain", type=str, default="code", choices=["code", "medical"],
+                     help="Which domain's outputs to serve (default: code)")
 _known, _ = _parser.parse_known_args()
 _SERVE_LAYER: int = _known.layer
+_SERVE_DOMAIN: str = _known.domain
 
 def _resolve_output_dir() -> Path:
     """return the directory where the requested layer's artefacts live."""
-    subdir = MEDICAL_OUTPUT_DIR / f"layer_{_SERVE_LAYER}"
+    base = CODE_OUTPUT_DIR if _SERVE_DOMAIN == "code" else MEDICAL_OUTPUT_DIR
+    subdir = base / f"layer_{_SERVE_LAYER}"
     if subdir.exists():
         return subdir
-    # fallback: legacy single-layer layout at root
-    return MEDICAL_OUTPUT_DIR
+    return base
 
 _OUTPUT_DIR = _resolve_output_dir()
 _HOOK_POINT = f"blocks.{_SERVE_LAYER}.hook_{HOOK_TYPE}"
