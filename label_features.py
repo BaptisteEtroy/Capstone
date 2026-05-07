@@ -55,12 +55,14 @@ class LabeledFeature:
     category: str = "General/Other"  # broad semantic category for thesis figures
 
 
-# feature categorisation
+# feature categorisation — separate rule sets per domain
+
+_CATEGORY_FALLBACK = "General/Other"
 
 # rules are checked in order, first match wins
 # each rule is (list of lowercase keywords to search in label, category name)
-_CATEGORY_RULES: List[Tuple[List[str], str]] = [
-    # structural/linguistic - expanded to catch heuristic positional labels
+
+_CATEGORY_RULES_MEDICAL: List[Tuple[List[str], str]] = [
     (["structural", "positional", "punctuation", "special token", "numeric", "digit",
       "formatting", "whitespace", "early position", "late position", "sequence position",
       "early-position", "late-position", "fixed-position", "context-start", "context-end",
@@ -69,7 +71,6 @@ _CATEGORY_RULES: List[Tuple[List[str], str]] = [
       "citation", "reference number", "journal", "publication", "bibliography",
       "abbreviation", "acronym", "parenthetical", "list marker"],
      "Structural/Linguistic"),
-    # research methodology - expanded
     (["research", "study design", "trial", "randomized", "cohort", "meta-analysis",
       "systematic review", "statistical", "methodology", "experimental design",
       "clinical study", "sample size", "control group", "bias",
@@ -78,7 +79,6 @@ _CATEGORY_RULES: List[Tuple[List[str], str]] = [
       "retrospective", "case-control", "blinding", "placebo", "survey",
       "questionnaire", "measurement", "instrument validation"],
      "Research Methodology"),
-    # pharmacology - expanded
     (["pharmacol", "drug", "medication", "therapeutic", "treatment", "dose", "dosage",
       "antibiotic", "inhibitor", "agonist", "antagonist", "pharmaceutical",
       "prescription", "side effect", "adverse", "toxicity",
@@ -86,24 +86,20 @@ _CATEGORY_RULES: List[Tuple[List[str], str]] = [
       "anti-inflammatory", "antiviral", "antifungal", "antimicrobial",
       "contraindic", "drug interaction", "pharmacokinetic", "bioavailab"],
      "Pharmacology"),
-    # microbiology/infectious disease
     (["bacteri", "viral", "virus", "fung", "parasit", "infect",
       "pathogen", "microb", "sepsis", "steriliz", "contagi",
       "endotoxin", "exotoxin", "biofilm", "antimicrobial resistance",
       "gram-positive", "gram-negative", "flora", "prion"],
      "Microbiology/Infectious"),
-    # oncology
     (["cancer", "tumor", "tumour", "oncol", "malign", "metasta",
       "carcinoma", "lymphoma", "leukemia", "neoplasm", "sarcoma",
       "staging", "grading", "biopsy", "remission", "recurrence"],
      "Oncology"),
-    # mental health/psych
     (["psych", "depress", "anxiety", "cognitive", "emotion",
       "mental health", "schizoph", "autism", "bipolar", "adhd",
       "behavioral", "behaviour", "neuropsych", "dementia", "therapy session",
       "counseling", "counselling", "psychiatric", "mood"],
      "Mental Health/Psych"),
-    # biochemical/molecular - expanded
     (["gene", "protein", "enzyme", "pathway", "metabolism", "biochem",
       "molecular", "cellular", "receptor", "hormone", "signal transduction",
       "amino acid", "nucleotide", "mrna", "expression",
@@ -113,21 +109,18 @@ _CATEGORY_RULES: List[Tuple[List[str], str]] = [
       "mitochond", "ribosom", "atp", "cytoplasm", "membrane transport",
       "ion channel", "catalytic", "substrate"],
      "Biochemical/Molecular"),
-    # epidemiological - expanded
     (["epidemiol", "prevalence", "incidence", "mortality", "public health",
       "outbreak", "surveillance", "population", "risk factor", "exposure",
       "screening", "socioeconomic", "disparit", "morbidity", "demographic",
       "age-adjusted", "endemic", "pandemic", "epidemic", "vaccination rate",
       "health outcome", "social determinant"],
      "Epidemiological"),
-    # anatomical - expanded
     (["anatomical", "anatomy", "organ", "tissue", "muscle", "bone", "nerve",
       "artery", "vein", "gland", "vessel", "tract", "cavity", "region",
       "ligament", "tendon", "cartilage", "fascia", "peritoneum", "pleura",
       "mediastin", "meninges", "spinal cord", "brain region", "cortex",
       "cerebr", "thorac", "abdomin", "pelvi", "cranial"],
      "Anatomical"),
-    # clinical/diagnostic - expanded
     (["clinical", "diagnosis", "diagnostic", "symptom", "sign", "presentation",
       "complication", "syndrome", "disease", "disorder", "condition", "finding",
       "examination", "assessment", "patient", "surgical", "procedure", "patholog",
@@ -146,18 +139,104 @@ _CATEGORY_RULES: List[Tuple[List[str], str]] = [
      "Clinical/Diagnostic"),
 ]
 
-_CATEGORY_FALLBACK = "General/Other"
+_CATEGORY_RULES_CODE: List[Tuple[List[str], str]] = [
+    # structural/linguistic — positional + syntactic tokens (same across domains)
+    (["structural", "positional", "punctuation", "special token", "numeric", "digit",
+      "formatting", "whitespace", "early position", "late position", "sequence position",
+      "early-position", "late-position", "fixed-position", "context-start", "context-end",
+      "document/sequence start", "document boundary", "end-of-text",
+      "conjunction", "pronoun", "preposition", "connective", "connector",
+      "abbreviation", "acronym", "parenthetical", "list marker", "indentation",
+      "operator", "delimiter", "bracket", "semicolon", "newline"],
+     "Structural/Linguistic"),
+    # data structures
+    (["array", "list", "dict", "map", "tree", "graph", "stack", "queue",
+      "hash", "set ", "tuple", "vector", "matrix", "heap", "linked list",
+      "data structure", "collection", "container", "sequence", "buffer"],
+     "Data Structures"),
+    # control flow
+    (["loop", "iteration", "conditional", "branch", "if-else", "switch",
+      "return statement", "control flow", "break", "continue", "goto",
+      "recursion", "recursive", "while", "for loop"],
+     "Control Flow"),
+    # functions / methods
+    (["function", "method", "lambda", "closure", "callback", "decorator",
+      "parameter", "argument", "signature", "callable", "subroutine",
+      "yield", "generator", "coroutine definition"],
+     "Functions/Methods"),
+    # types / annotations
+    (["type hint", "type annotation", "generic", "interface", "abstract",
+      "cast", "schema", "typedef", "union type", "optional type",
+      "dataclass", "struct", "enum", "protocol", "typing"],
+     "Types/Annotations"),
+    # string / text processing
+    (["string", "substring", "regex", "pattern match", "parse", "format string",
+      "encode", "decode", "escape", "template", "interpolat", "concatenat",
+      "strip", "split", "join", "replace", "char sequence"],
+     "String/Text Processing"),
+    # numeric / math
+    (["arithmetic", "integer", "float", "scalar", "numeric", "math",
+      "calculat", "threshold", "range", "modulo", "bitwise", "precision",
+      "rounding", "absolute value", "logarithm", "exponent"],
+     "Numeric/Math"),
+    # IO / file operations
+    (["file", "path", "read", "write", "open", "close", "directory",
+      "stream", "io ", "stdin", "stdout", "stderr", "filesystem",
+      "serializ", "deserializ", "json load", "csv", "pickle"],
+     "IO/File Operations"),
+    # network / protocols
+    (["http", "socket", "tcp", "udp", "api", "request", "response",
+      "url", "rest", "websocket", "grpc", "rpc", "endpoint",
+      "header", "payload", "protocol", "network", "port", "proxy",
+      "authentication", "oauth", "token", "session", "cookie"],
+     "Network/Protocols"),
+    # databases / queries
+    (["sql", "query", "database", "table", "row", "column", "index",
+      "orm", "schema", "transaction", "migration", "join", "select",
+      "insert", "update", "delete", "cursor", "connection pool"],
+     "Databases/Queries"),
+    # error handling
+    (["error", "exception", "warning", "assert", "raise", "traceback",
+      "debug", "logging", "stacktrace", "try", "catch", "finally",
+      "fault", "invalid", "crash", "failure"],
+     "Error Handling"),
+    # testing / QA
+    (["test", "assert", "mock", "fixture", "coverage", "spec",
+      "benchmark", "unit test", "integration test", "pytest", "unittest"],
+     "Testing/QA"),
+    # concurrency / async
+    (["thread", "async", "await", "lock", "semaphore", "mutex",
+      "process", "concurrent", "parallel", "event loop", "future",
+      "promise", "asyncio", "multiprocess"],
+     "Concurrency/Async"),
+    # ML / AI
+    (["model", "train", "loss", "gradient", "tensor", "epoch", "inference",
+      "neural", "weight", "layer", "backprop", "optimizer", "dataset",
+      "batch", "embedding", "attention", "transformer"],
+     "ML/AI"),
+    # version control / DevOps
+    (["git", "commit", "branch", "merge", "deploy", "container", "docker",
+      "ci/cd", "pipeline", "release", "build", "package", "dependency",
+      "version", "changelog", "tag"],
+     "Version Control/DevOps"),
+    # OOP / classes
+    (["class", "object", "inherit", "instance", "attribute", "property",
+      "constructor", "destructor", "polymorphism", "encapsulation",
+      "overrid", "overload", "subclass", "superclass", "self.", "this."],
+     "OOP/Classes"),
+]
 
 
-def categorize_label(label: str) -> str:
+def categorize_label(label: str, domain: str = "code") -> str:
     """
     map a free-form feature label to a broad semantic category.
 
-    checks _CATEGORY_RULES in order (first match wins) against the lowercased label.
+    checks domain-specific rules in order (first match wins) against the lowercased label.
     returns _CATEGORY_FALLBACK if no rule matches.
     """
+    rules = _CATEGORY_RULES_CODE if domain == "code" else _CATEGORY_RULES_MEDICAL
     lower = label.lower()
-    for keywords, category in _CATEGORY_RULES:
+    for keywords, category in rules:
         if any(kw in lower for kw in keywords):
             return category
     return _CATEGORY_FALLBACK
@@ -165,7 +244,7 @@ def categorize_label(label: str) -> str:
 
 # openai API
 
-_SYSTEM_PROMPT = (
+_SYSTEM_PROMPT_MEDICAL = (
     "You are an expert in mechanistic interpretability of neural networks. "
     "Your task is to label features extracted from a Sparse Autoencoder (SAE) "
     "trained on Llama 3.2 1B Instruct processing medical/clinical text. "
@@ -177,9 +256,22 @@ _SYSTEM_PROMPT = (
     "'text features', 'linguistic', or 'general concepts'."
 )
 
+_SYSTEM_PROMPT_CODE = (
+    "You are an expert in mechanistic interpretability of neural networks. "
+    "Your task is to label features extracted from a Sparse Autoencoder (SAE) "
+    "trained on Llama 3.2 1B Instruct processing Python source code and programming Q&A. "
+    "MaxAct tokens are real input tokens (with activation strengths) that triggered "
+    "the feature — they show what the feature DETECTS. "
+    "VocabProj tokens are output tokens the feature PROMOTES — they show what the "
+    "feature CAUSES the model to predict. "
+    "Give specific, concrete labels — avoid vague terms like 'code patterns', "
+    "'programming features', 'syntax elements', or 'general concepts'."
+)
 
-def call_llm(prompt: str, model: str = "gpt-4o-mini") -> str:
+
+def call_llm(prompt: str, model: str = "gpt-4o-mini", domain: str = "code") -> str:
     """call openai API for feature labeling."""
+    system_prompt = _SYSTEM_PROMPT_CODE if domain == "code" else _SYSTEM_PROMPT_MEDICAL
     try:
         from openai import OpenAI
         client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -187,7 +279,7 @@ def call_llm(prompt: str, model: str = "gpt-4o-mini") -> str:
             model=model,
             max_tokens=2000,
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
         )
@@ -362,7 +454,7 @@ def _positional_label(
     return None
 
 
-def heuristic_label_feature(feature: Dict[str, Any]) -> Optional[LabeledFeature]:
+def heuristic_label_feature(feature: Dict[str, Any], domain: str = "code") -> Optional[LabeledFeature]:
     """
     try to label a feature using rule-based heuristics (no API).
     returns LabeledFeature if any heuristic fires, else None.
@@ -397,7 +489,7 @@ def heuristic_label_feature(feature: Dict[str, Any]) -> Optional[LabeledFeature]
             reasoning="Heuristic: token string pattern analysis",
             quality_score=quality, label_source="heuristic_token",
             maxact_entropy=entropy, source_breakdown=src_breakdown,
-            category=categorize_label(label),
+            category=categorize_label(label, domain),
         )
 
     pos_mean = feature.get("position_mean", 0.0)
@@ -411,7 +503,7 @@ def heuristic_label_feature(feature: Dict[str, Any]) -> Optional[LabeledFeature]
             reasoning=f"Heuristic: positional (mean={pos_mean:.1f}, std={pos_std:.1f})",
             quality_score=quality, label_source="heuristic_positional",
             maxact_entropy=entropy, source_breakdown=src_breakdown,
-            category=categorize_label(label),
+            category=categorize_label(label, domain),
         )
 
     return None
@@ -475,27 +567,53 @@ def extract_feature_tokens(feature: Dict[str, Any]) -> tuple:
     return max_act_tokens, vocab_proj
 
 
-def build_batch_prompt(features_batch: List[Dict[str, Any]]) -> str:
+_PROMPT_CONTEXT = {
+    "medical": (
+        "processing medical/clinical Q&A conversations (medmcqa, pubmed_qa, clinical summaries)",
+        [
+            "FEATURE 123: drug dosage instructions | high | Triggers 'mg', '500', 'twice'; promotes 'daily', 'dose'",
+            "FEATURE 456: UNLABELED | low | Triggers span unrelated domains with no coherent pattern",
+            "FEATURE 789: patient symptom onset descriptions | medium | Triggers 'sudden', 'weeks', 'onset'; promotes 'symptoms'",
+            "FEATURE 101: surgical anatomy terms | high | Triggers 'artery', 'vein', 'incision'; promotes anatomical terms",
+        ],
+        "'drug dosage instructions', 'patient age qualifiers', 'surgical procedure names'",
+        "'language patterns', 'text features', 'medical terms', 'general concepts'",
+    ),
+    "code": (
+        "processing Python source code and programming Q&A (code_search_net, CodeAlpaca, python-codes)",
+        [
+            "FEATURE 123: dictionary key lookup operations | high | Triggers 'key', 'keys', 'get'; promotes 'dict', 'value'",
+            "FEATURE 456: UNLABELED | low | Triggers span unrelated concepts with no coherent pattern",
+            "FEATURE 789: HTTP request headers | medium | Triggers 'header', 'Content-Type', 'Accept'; promotes 'headers', 'request'",
+            "FEATURE 101: list comprehension syntax | high | Triggers 'for', 'in', '['; promotes 'if', ']', 'range'",
+        ],
+        "'dictionary key lookup', 'async function definitions', 'SQL WHERE clause filters'",
+        "'code patterns', 'programming features', 'syntax elements', 'general concepts'",
+    ),
+}
+
+
+def build_batch_prompt(features_batch: List[Dict[str, Any]], domain: str = "code") -> str:
     """
     build a labeling prompt that shows activation strengths prominently and
     samples from quantiles (not just top tokens) for better generalisation.
 
     key design choices:
-    - explicitly tells gpt-4o-mini the model is llama 3.2 1b instruct on medical chat data
+    - explicitly tells gpt-4o-mini the model domain (medical vs code)
     - shows activation magnitude alongside context (not just token string)
     - samples from top/mid/low tiers to reveal the feature's true range
     - no chain-of-thought in reasoning field (CoT doesn't improve quality per arXiv:2410.13928)
     """
+    ctx_desc, examples, specific_ex, vague_ex = _PROMPT_CONTEXT.get(domain, _PROMPT_CONTEXT["code"])
+
     features_text = ""
     for feature in features_batch:
         max_act_tokens, vocab_proj_tokens = extract_feature_tokens(feature)
 
         max_act_parts = []
         for tok, act, ctx in max_act_tokens:
-            # truncate context to a short snippet around the trigger token
             ctx_snippet = ""
             if ctx:
-                # find [TOKEN] marker and show +/- 30 chars
                 m = re.search(r"\[([^\]]+)\]", ctx)
                 if m:
                     start = max(0, m.start() - 30)
@@ -521,8 +639,9 @@ Promotes (VocabProj, logit boost):
   {', '.join(vocab_parts) if vocab_parts else 'No data'}
 ---"""
 
+    examples_str = "\n".join(examples)
     prompt = f"""Analyze these SAE features from a Sparse Autoencoder trained on Llama 3.2 1B Instruct
-processing medical/clinical Q&A conversations (medmcqa, pubmed_qa, clinical summaries).
+{ctx_desc}.
 
 Each feature:
 - "Triggers" = tokens sampled from HIGH, MID, and LOW activation tiers that fire this feature
@@ -532,8 +651,8 @@ Each feature:
 Rules:
 1. Label ONLY if the trigger tokens form a coherent semantic pattern across ALL tiers.
 2. Use "UNLABELED" if tokens seem random, mixed across unrelated domains, or incoherent.
-3. Be SPECIFIC: "drug dosage instructions", "patient age qualifiers", "surgical procedure names".
-4. AVOID vague labels: "language patterns", "text features", "medical terms", "general concepts".
+3. Be SPECIFIC: {specific_ex}.
+4. AVOID vague labels: {vague_ex}.
 5. High confidence = pattern is clear across all activation tiers.
 6. Medium confidence = mostly coherent but some noise, or only top tier is consistent.
 7. Low confidence = weak signal, lean toward UNLABELED.
@@ -544,10 +663,7 @@ Respond with EXACTLY one line per feature:
 FEATURE <id>: <LABEL or UNLABELED> | <high/medium/low> | <brief reasoning (no chain-of-thought)>
 
 Examples:
-FEATURE 123: drug dosage instructions | high | Triggers 'mg', '500', 'twice'; promotes 'daily', 'dose'
-FEATURE 456: UNLABELED | low | Triggers span unrelated domains with no coherent pattern
-FEATURE 789: patient symptom onset descriptions | medium | Triggers 'sudden', 'weeks', 'onset'; promotes 'symptoms'
-FEATURE 101: surgical anatomy terms | high | Triggers 'artery', 'vein', 'incision'; promotes anatomical terms"""
+{examples_str}"""
 
     return prompt
 
@@ -584,6 +700,7 @@ def parse_batch_response(response: str, features_batch: List[Dict]) -> List[tupl
 def label_features(
     features: List[Dict],
     no_filter: bool = False,
+    domain: str = "code",
 ) -> List[LabeledFeature]:
     """
     label features using heuristics first, then gpt-4o-mini for the rest.
@@ -605,7 +722,7 @@ def label_features(
 
     print("\nStep 1: Heuristic labeling (all features, no API)...")
     for f in tqdm(features, desc="  Heuristic"):
-        result = heuristic_label_feature(f)
+        result = heuristic_label_feature(f, domain=domain)
         if result:
             heuristic_labeled[f["index"]] = result
 
@@ -641,8 +758,8 @@ def label_features(
     for i in tqdm(range(0, len(features_to_label), batch_size), desc="  gpt-4o-mini batches"):
         batch = features_to_label[i:i + batch_size]
         try:
-            prompt = build_batch_prompt(batch)
-            response = call_llm(prompt, model)
+            prompt = build_batch_prompt(batch, domain=domain)
+            response = call_llm(prompt, model, domain=domain)
             results = parse_batch_response(response, batch)
 
             labeled_ids = set()
@@ -663,7 +780,7 @@ def label_features(
                         label_source="gpt4omini",
                         maxact_entropy=feature_lookup[feature_id].get("maxact_entropy", 0.0),
                         source_breakdown=feature_lookup[feature_id].get("source_breakdown", {}),
-                        category=categorize_label(label),
+                        category=categorize_label(label, domain),
                     ))
                 else:
                     unlabeled_count += 1
@@ -780,7 +897,7 @@ def main():
 
     print(f"Loaded {len(features)} features from {features_path} (domain: {args.domain}, layer {args.layer})")
 
-    labeled_features = label_features(features, no_filter=args.no_filter)
+    labeled_features = label_features(features, no_filter=args.no_filter, domain=args.domain)
 
     print_labeled_features(labeled_features)
 

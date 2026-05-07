@@ -834,7 +834,11 @@ def save_results(
     print(f"  Saved token_ids: {token_ids.shape}")
 
     if source_ids is not None and source_list is not None:
-        torch.save(source_ids, output_dir / "source_ids.pt")
+        # numpy .npy format: sequential write, no zip central-directory → never truncates
+        import numpy as np
+        tmp_path = output_dir / "source_ids.npy.tmp"
+        np.save(tmp_path, source_ids.numpy().astype(np.int16))
+        tmp_path.rename(output_dir / "source_ids.npy")
         with open(output_dir / "source_list.json", "w") as f:
             json.dump(source_list, f)
         print(f"  Saved source_ids: {source_ids.shape[0]:,} tokens, {len(source_list)} sources")
@@ -1258,7 +1262,7 @@ def main():
 
         manifest_path   = layer_dir / "activations.json"
         token_ids_path  = layer_dir / "token_ids.pt"
-        source_ids_path = layer_dir / "source_ids.pt"
+        source_ids_path = layer_dir / "source_ids.npy"
         source_list_path = layer_dir / "source_list.json"
 
         if args.skip_collection and manifest_path.exists() and token_ids_path.exists():
@@ -1266,7 +1270,8 @@ def main():
             with open(manifest_path) as f:
                 chunk_files = [Path(p) for p in json.load(f)]
             token_ids = torch.load(token_ids_path)
-            source_ids = torch.load(source_ids_path) if source_ids_path.exists() else None
+            import numpy as np
+            source_ids = torch.from_numpy(np.load(source_ids_path).astype(np.int64)) if source_ids_path.exists() else None
             source_list = json.load(open(source_list_path)) if source_list_path.exists() else None
             print(f"  Found {len(chunk_files)} chunks, {token_ids.shape[0]:,} tokens")
         else:

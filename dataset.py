@@ -12,9 +12,9 @@ medical sources (~1/3 each, ~150k total):
   3. pubMed abs   -- abstracts wrapped as summarisation instructions
 
 code sources (~1/3 each, ~150k total):
-  1. code_search_net Python  -- docstring as question, function body as answer
-  2. mbpp                    -- problem description as question, solution as answer
-  3. codeparrot/github-code  -- Python files wrapped as "explain this code" instructions
+  1. code_search_net Python       -- docstring as question, function body as answer
+  2. sahil2801/CodeAlpaca-20k     -- instruction → Python code pairs (20k samples)
+  3. flytech/python-codes-25k     -- instruction → Python code pairs (49k samples)
 """
 
 from datasets import load_dataset
@@ -256,91 +256,152 @@ def _stream_code_search_net(max_count: int, max_tokens: int) -> Iterator[Tuple[s
         print(f"  code_search_net unavailable ({e})")
 
 
-def _stream_mbpp(count_offset: int, max_count: int, max_tokens: int) -> Iterator[Tuple[str, str]]:
-    """mbpp: natural language problem description → Python solution."""
+def _stream_code_alpaca(count_offset: int, max_count: int, max_tokens: int) -> Iterator[Tuple[str, str]]:
+    """sahil2801/CodeAlpaca-20k: instruction → Python code pairs (20k samples)."""
     count = count_offset
     try:
-        ds = load_dataset("mbpp", split="train", streaming=True, trust_remote_code=True)
+        ds = load_dataset("sahil2801/CodeAlpaca-20k", split="train", streaming=True)
         for item in ds:
-            problem = (item.get("text") or "").strip()
-            code    = (item.get("code") or "").strip()
-            if not problem or not code:
+            instruction = (item.get("instruction") or "").strip()
+            code        = (item.get("output") or "").strip()
+            if not instruction or not code:
                 continue
-            question = f"Write a Python function to solve the following problem:\n\n{problem}"
-            answer   = f"```python\n{code[:max_tokens * 4]}\n```"
-            yield _chat(question, answer), f"mbpp:{count}"
+            yield _chat(instruction, code[:max_tokens * 4]), f"code_alpaca:{count}"
             count += 1
             if count >= max_count:
                 return
-        print(f"  [dataset] mbpp: {count - count_offset} samples")
+        print(f"  [dataset] CodeAlpaca: {count - count_offset} samples")
     except Exception as e:
-        print(f"  mbpp unavailable ({e})")
+        print(f"  CodeAlpaca unavailable ({e})")
 
 
-def _stream_github_code(count_offset: int, num_samples: int, max_tokens: int) -> Iterator[Tuple[str, str]]:
-    """codeparrot/github-code Python: real GitHub files wrapped as explain-this-code instructions."""
+def _stream_flytech_python(count_offset: int, num_samples: int, max_tokens: int) -> Iterator[Tuple[str, str]]:
+    """flytech/python-codes-25k: instruction → Python code pairs (49k samples)."""
     count = count_offset
     try:
-        ds = load_dataset(
-            "codeparrot/github-code", streaming=True, split="train", trust_remote_code=True,
-        )
+        ds = load_dataset("flytech/python-codes-25k", split="train", streaming=True)
         for item in ds:
-            if item.get("language") != "Python":
+            instruction = (item.get("instruction") or "").strip()
+            code        = (item.get("output") or "").strip()
+            if not instruction or not code:
                 continue
-            code = (item.get("code") or "").strip()
-            if not code or len(code) < 100:
-                continue
-            snippet  = code[:max_tokens * 4]
-            question = f"Explain what the following Python code does and how it works:\n\n```python\n{snippet}\n```"
-            answer   = "This code defines functions and logic to accomplish the described task. It uses standard Python patterns and idioms."
-            yield _chat(question, answer), f"github_code:{count}"
+            yield _chat(instruction, code[:max_tokens * 4]), f"flytech_python:{count}"
             count += 1
             if count >= num_samples:
                 return
-        print(f"  [dataset] github-code: {count - count_offset} samples")
+        print(f"  [dataset] flytech-python: {count - count_offset} samples")
     except Exception as e:
-        print(f"  github-code unavailable ({e}), skipping third code source")
+        print(f"  flytech-python unavailable ({e}), skipping third code source")
 
 
 def stream_code_texts(num_samples: int, max_tokens: int) -> Iterator[Tuple[str, str]]:
     """
     streams (text, source_id) tuples of Python code Q&A formatted as llama 3.2
-    instruct chat conversations. yields ~num_samples/3 from each of three sources.
+    instruct chat conversations. yields exactly num_samples/3 from each source.
+
+    uses round-robin interleaving so all three sources contribute throughout
+    training, not sequentially. small datasets (CodeAlpaca, flytech) are loaded
+    into memory once and cycled so they match the per-source quota exactly.
 
     Args:
         num_samples: total number of samples to stream.
         max_tokens:  token budget per sample (used to cap code length).
 
     Yields:
-        (text, source_id) where source_id identifies the origin
-        e.g. "code_search_net:1234", "mbpp:5678", "the_stack:9012"
+        (text, source_id) e.g. "code_search_net:42", "code_alpaca:43"
     """
-    third = num_samples // 3
+    import itertools
 
-    src1_count = 0
-    for text, source_id in _stream_code_search_net(third, max_tokens):
-        yield text, source_id
-        src1_count += 1
-    print(f"  [dataset] Source 1 (code_search_net): {src1_count} / {third} samples")
+    target = num_samples // 3   # per-source target
 
-    src2_count = 0
-    src2_start = src1_count
-    for text, source_id in _stream_mbpp(src2_start, src2_start + third, max_tokens):
-        yield text, source_id
-        src2_count += 1
-    print(f"  [dataset] Source 2 (mbpp): {src2_count} / {third} samples")
+    # source 1: code_search_net — huge, stream directly (no cycling needed)
+    def _csn_infinite():
+        while True:
+            try:
+                ds = load_dataset(
+                    "code_search_net", "python", split="train",
+                    streaming=True, trust_remote_code=True,
+                )
+                for item in ds:
+                    doc  = (item.get("func_documentation_string") or "").strip()
+                    code = (item.get("func_code_string") or "").strip()
+                    if doc and code:
+                        q = f"Write a Python function that does the following:\n\n{doc}"
+                        a = f"```python\n{code[:max_tokens * 4]}\n```"
+                        yield _chat(q, a), "code_search_net"
+            except Exception as e:
+                print(f"  code_search_net reload error: {e}")
+                break
 
-    src3_count = 0
-    src3_start = src1_count + src2_count
-    for text, source_id in _stream_github_code(src3_start, num_samples, max_tokens):
-        yield text, source_id
-        src3_count += 1
-    print(f"  [dataset] Source 3 (github-code): {src3_count} samples")
+    # sources 2 & 3: small datasets — load into memory once, then cycle
+    def _load_alpaca():
+        rows = []
+        try:
+            ds = load_dataset("sahil2801/CodeAlpaca-20k", split="train")
+            for item in ds:
+                instruction = (item.get("instruction") or "").strip()
+                output      = (item.get("output") or "").strip()
+                if instruction and output:
+                    rows.append(_chat(instruction, output[:max_tokens * 4]))
+            print(f"  [dataset] CodeAlpaca loaded: {len(rows)} samples (will cycle)")
+        except Exception as e:
+            print(f"  CodeAlpaca unavailable: {e}")
+        return rows
 
-    total = src1_count + src2_count + src3_count
-    print(f"  [dataset] Total collected: {total} / {num_samples} samples")
-    if total < num_samples * 0.8:
-        print(
-            f"  WARNING: Only {total}/{num_samples} samples collected "
-            f"({100*total/num_samples:.0f}%). Some sources may be unavailable."
-        )
+    def _load_flytech():
+        rows = []
+        try:
+            ds = load_dataset("flytech/python-codes-25k", split="train")
+            for item in ds:
+                instruction = (item.get("instruction") or "").strip()
+                output      = (item.get("output") or "").strip()
+                if instruction and output:
+                    rows.append(_chat(instruction, output[:max_tokens * 4]))
+            print(f"  [dataset] flytech-python loaded: {len(rows)} samples (will cycle)")
+        except Exception as e:
+            print(f"  flytech-python unavailable: {e}")
+        return rows
+
+    alpaca_rows  = _load_alpaca()
+    flytech_rows = _load_flytech()
+
+    gen1 = _csn_infinite()
+    gen2 = itertools.cycle(alpaca_rows)  if alpaca_rows  else iter([])
+    gen3 = itertools.cycle(flytech_rows) if flytech_rows else iter([])
+
+    counts = [0, 0, 0]
+    total  = 0
+
+    # round-robin: one sample from each source per tick
+    for _ in range(target):
+        try:
+            text, src = next(gen1)
+            yield text, f"{src}:{total}"
+            counts[0] += 1
+            total += 1
+        except StopIteration:
+            pass
+
+        if counts[1] < target:
+            try:
+                text = next(gen2)
+                yield text, f"code_alpaca:{total}"
+                counts[1] += 1
+                total += 1
+            except StopIteration:
+                pass
+
+        if counts[2] < target:
+            try:
+                text = next(gen3)
+                yield text, f"flytech_python:{total}"
+                counts[2] += 1
+                total += 1
+            except StopIteration:
+                pass
+
+    names = ["code_search_net", "code_alpaca", "flytech_python"]
+    print(f"  [dataset] Total collected: {total} / {num_samples}")
+    for name, cnt in zip(names, counts):
+        pct = 100 * cnt / total if total else 0
+        print(f"  [dataset]   {name:30s} {cnt:7,}  ({pct:.1f}%)")
