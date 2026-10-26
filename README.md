@@ -1,4 +1,4 @@
-Read full thesis [here](github.com/BaptisteEtroy/Capstone/blob/main/main.pdf)
+Read full thesis [here](https://github.com/BaptisteEtroy/Capstone/blob/main/main.pdf)
 
 # Medical SAE Interpretability Lab
 
