@@ -1,3 +1,5 @@
+Read full thesis [here](github.com/BaptisteEtroy/Capstone/blob/main/main.pdf)
+
 # Medical SAE Interpretability Lab
 
 A mechanistic interpretability tool for **Llama 3.2 1B-Instruct**. Trains a **BatchTopK Sparse Autoencoder (SAE)** on residual stream activations from medical text, decomposes internal representations into 8,192 interpretable features, and exposes them through an interactive web UI — letting you chat with the model while observing exactly which features activate, and steer its outputs by amplifying or suppressing specific concepts.
